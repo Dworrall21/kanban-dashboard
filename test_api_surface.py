@@ -484,6 +484,22 @@ class TestProfileCRUD(IsolatedKanbanMixin, TestServerMixin, unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(parsed['name'], 'default')
 
+    def test_get_profile_without_pyyaml(self):
+        import builtins
+        real_import = builtins.__import__
+
+        def side_effect(name, *args, **kwargs):
+            if name == 'yaml':
+                raise ModuleNotFoundError("No module named 'yaml'")
+            return real_import(name, *args, **kwargs)
+
+        with patch('builtins.__import__', side_effect=side_effect):
+            status, parsed, raw = self.request('/api/profile/test-profile')
+        self.assertEqual(status, 200)
+        self.assertEqual(parsed['name'], 'test-profile')
+        self.assertEqual(parsed['model_default'], 'gpt-4')
+        self.assertEqual(parsed['provider'], 'openai')
+
     @patch('kanban_browser.subprocess.run', side_effect=_subprocess_side_effect)
     def test_create_profile(self, mock_run):
         status, parsed, raw = self.request('/api/profile', method='POST', data={
