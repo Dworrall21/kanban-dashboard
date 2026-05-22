@@ -40,6 +40,7 @@ _PROFILE_CACHE = {'profiles': None, 'current': None, 'ts': 0.0}
 _PROFILE_CACHE_TTL = 30.0
 _LIST_CACHE: dict[tuple[str, str], dict] = {}
 _LIST_CACHE_TTL = 2.5
+_PROFILE_CONFIG_CACHE: dict[str, dict] = {}
 
 
 def _now() -> float:
@@ -142,6 +143,33 @@ def _parse_simple_yaml_profile(text: str) -> dict:
             if isinstance(section, dict):
                 section[key] = parsed
     return result
+
+
+
+def _load_profile_config(config_path: Path) -> dict:
+    """Load a profile config with light mtime-based caching.
+
+    Falls back to a simple YAML parser when PyYAML is unavailable.
+    """
+    key = str(config_path)
+    try:
+        mtime = config_path.stat().st_mtime
+    except OSError:
+        return {}
+    cached = _PROFILE_CONFIG_CACHE.get(key)
+    if cached and cached.get('mtime') == mtime:
+        return cached.get('data', {})
+    raw = config_path.read_text(encoding='utf-8')
+    try:
+        import yaml
+        data = yaml.safe_load(raw) or {}
+    except ModuleNotFoundError:
+        print('[kanban_browser] PyYAML missing; using fallback profile parser', file=sys.stderr, flush=True)
+        data = _parse_simple_yaml_profile(raw)
+    if not isinstance(data, dict):
+        data = {}
+    _PROFILE_CONFIG_CACHE[key] = {'mtime': mtime, 'data': data}
+    return data
 
 
 _MIME_TYPES = {
@@ -1214,13 +1242,7 @@ class H(BaseHTTPRequestHandler):
             self.send_json({'error': f'profile not found: {name}'}, 404)
             return
         try:
-            raw = config_path.read_text(encoding='utf-8')
-            try:
-                import yaml
-                data = yaml.safe_load(raw) or {}
-            except ModuleNotFoundError:
-                print('[kanban_browser] PyYAML missing; using fallback profile parser', file=sys.stderr, flush=True)
-                data = _parse_simple_yaml_profile(raw)
+            data = _load_profile_config(config_path)
         except Exception as exc:
             self.send_json({'error': f'failed to read profile: {exc}'}, 500)
             return
