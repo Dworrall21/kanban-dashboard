@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📋</text></svg>">
+  <title>Hermes Kanban Live</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+<body>
+<header role="banner">
+<div>
+  <h1>Hermes Kanban Live <span class="pill" id="boardName">{{BOARD_NAME}}</span></h1>
+  <div class="meta" id="summary">Loading…</div>
+</div>
+<div class="toolbar">
+  <label class="small" for="boardSelect">Board</label>
+  <select id="boardSelect" class="board-select"></select>
+  <button class="button danger" id="deleteBoardBtn" type="button">Delete board</button>
+  <label class="small" for="profileSelect">Profile</label>
+  <select id="profileSelect" class="board-select"></select>
+  <button class="button secondary" id="profileConfirmBtn" type="button">Profile active</button>
+  <span class="small" id="profileState">Active: default</span>
+  <button class="button secondary" id="editProfilesBtn" type="button">Edit profiles</button>
+  <div class="view-toggle" id="viewToggle">
+    <button class="active" data-view="table" title="Table view">Table</button>
+    <button data-view="board" title="Board view">Board</button>
+  </div>
+  <button class="button" id="refreshBtn" type="button">Refresh</button>
+  <div class="small" id="sseStatus">live via SSE</div>
+</div>
+<div class="search-bar">
+  <input type="text" id="searchInput" class="search-input" placeholder="🔍 Search tasks by title or ID…" autocomplete="off" spellcheck="false" />
+</div>
+<div class="filter-row" id="filterRow">
+  <span class="small-label">Filter:</span>
+  <span class="filter-chip active" data-status="all" id="chip-all">All</span>
+  <span class="filter-chip" data-status="ready" id="chip-ready">Ready <span class="chip-count" id="count-ready">0</span></span>
+  <span class="filter-chip" data-status="running" id="chip-running">Running <span class="chip-count" id="count-running">0</span></span>
+  <span class="filter-chip" data-status="done" id="chip-done">Done <span class="chip-count" id="count-done">0</span></span>
+  <span class="filter-chip" data-status="blocked" id="chip-blocked">Blocked <span class="chip-count" id="count-blocked">0</span></span>
+  <span class="filter-chip" data-status="todo" id="chip-todo">Todo <span class="chip-count" id="count-todo">0</span></span>
+  <div class="sort-group">
+    <select id="sortSelect" class="sort-select">
+      <option value="created">Date</option>
+      <option value="title">Title</option>
+      <option value="status">Status</option>
+    </select>
+    <span class="sort-toggle" id="sortDirToggle" title="Toggle sort direction">▲</span>
+  </div>
+</div>
+  </header>
+  <main><div class="wrap">
+<div class="table-view-container active" id="tableView">
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Status</th><th>Task</th><th>Assignee</th><th>Title</th></tr>
+      </thead>
+      <tbody id="tasks"></tbody>
+    </table>
+  </div>
+</div>
+<div class="kanban-board" id="kanbanBoard">
+  <div class="kanban-column todo" data-status="todo">
+    <div class="kanban-column-header">To Do <span class="count" id="count-todo-board">0</span></div>
+    <div class="kanban-column-body" id="col-todo"></div>
+  </div>
+  <div class="kanban-column ready" data-status="ready">
+    <div class="kanban-column-header">Ready <span class="count" id="count-ready-board">0</span></div>
+    <div class="kanban-column-body" id="col-ready"></div>
+  </div>
+  <div class="kanban-column running" data-status="running">
+    <div class="kanban-column-header">Running <span class="count" id="count-running-board">0</span></div>
+    <div class="kanban-column-body" id="col-running"></div>
+  </div>
+  <div class="kanban-column done" data-status="done">
+    <div class="kanban-column-header">Done <span class="count" id="count-done-board">0</span></div>
+    <div class="kanban-column-body" id="col-done"></div>
+  </div>
+  <div class="kanban-column blocked" data-status="blocked">
+    <div class="kanban-column-header">Blocked <span class="count" id="count-blocked-board">0</span></div>
+    <div class="kanban-column-body" id="col-blocked"></div>
+  </div>
+</div>
+<div class="card chat-side">
+  <div class="small" id="detailsLabel">Select a task</div>
+  <pre id="details">Click a task to see details.</pre>
+</div>
+</div>
+  </main>
+
+  <!-- Chat card: standalone module, no task dependency -->
+  <div id="chatComposerMount"></div>
+
+  <!-- Task creation card: standalone module, no chat dependency -->
+  <div id="taskComposerMount"></div>
+
+  <!-- Prompt response card -->
+  <div id="promptComposerMount"></div>
+
+  <!-- ===== Component Templates ===== -->
+
+  <template id="tpl-chat-composer">
+  <div class="card chat-card">
+<div class="chat-head">
+  <div>
+    <div class="chat-title">Project chat</div>
+    <div class="small">Direct the selected board/profile with instructions and follow-up questions.</div>
+  </div>
+  <div>
+    <div class="chat-status">Ready</div>
+    <div class="chat-session-name small" style="cursor:pointer;color:#4667f2;margin-top:2px;" title="Click to manage sessions">Session: ...</div>
+  </div>
+</div>
+<div class="chat-session-bar">
+  <span class="chat-session-badge" id="chatSessionBadge">...</span>
+  <button class="button secondary chat-sessions-btn" type="button" aria-label="Sessions" title="Manage sessions">Sessions</button>
+  <button class="button secondary chat-export-btn" type="button" aria-label="Export chat" title="Export chat">Export</button>
+  <div class="chat-export-menu" id="chatExportMenu">
+    <div class="chat-export-option" data-format="json">Export as JSON</div>
+    <div class="chat-export-option" data-format="markdown">Export as Markdown</div>
+  </div>
+</div>
+<div class="chat-detail"></div>
+<div class="chat-log"></div>
+<div class="chat-compose">
+  <textarea class="chat-input" placeholder="Tell the selected project what to do next…" aria-label="Message input"></textarea>
+  <div class="chat-actions">
+    <button class="button chat-send-btn" type="button" aria-label="Send message">Send</button>
+    <button class="button secondary chat-clear-btn" type="button" aria-label="Clear chat history">New session</button>
+  </div>
+</div>
+<div class="chat-live-wrap">
+  <div class="chat-live-header">
+    <span class="chat-live-label">Agent log</span>
+    <span class="chat-live-toggle">Show</span>
+  </div>
+  <pre class="chat-live collapsed"></pre>
+</div>
+  </div>
+  <!-- Session Manager Panel -->
+  <div id="chatSessionOverlay" class="session-overlay"></div>
+  <div id="chatSessionPanel" class="session-panel">
+<div class="session-panel-header">
+  <span class="session-panel-title">Chat Sessions</span>
+  <button class="session-panel-close" id="chatSessionPanelClose" type="button">&times;</button>
+</div>
+<div class="session-panel-body" id="chatSessionList">
+  <div class="session-loading">Loading sessions...</div>
+</div>
+  </div>
+  </template>
+
+  <template id="tpl-task-composer">
+  <div class="card task-card">
+<div class="task-head">
+  <div>
+    <div class="task-title">Create task</div>
+    <div class="small">Create a kanban task. Optionally link it to the current chat session.</div>
+  </div>
+  <div class="task-status">Ready</div>
+</div>
+<div class="task-detail"></div>
+<div class="task-profile-row">
+  <label class="small">Delegate as</label>
+  <select class="task-profile-select board-select" aria-label="Delegate profile"></select>
+  <button class="button secondary task-profile-confirm-btn" type="button">Profile active</button>
+  <span class="small task-profile-state">overseer</span>
+</div>
+<div class="task-compose">
+  <input class="task-input task-title-input" type="text" placeholder="Task title…" aria-label="Task title" autocomplete="off" spellcheck="false" />
+  <textarea class="task-input task-body-input" placeholder="Task description / instructions…" aria-label="Task description"></textarea>
+  <div class="task-actions">
+    <button class="button task-create-btn" type="button">Create task</button>
+    <button class="button secondary task-from-selection-btn" type="button">Create from selected</button>
+    <button class="button secondary task-from-chat-btn" type="button">Attach chat session</button>
+  </div>
+</div>
+  </div>
+  </template>
+
+  <template id="tpl-prompt-composer">
+  <div class="card prompt-card">
+<div class="prompt-head">
+  <div>
+    <div class="prompt-title">Prompt response</div>
+    <div class="small">Quick replies for approvals, sudo prompts, and other live responses.</div>
+  </div>
+  <div class="prompt-status">Ready</div>
+</div>
+<div class="prompt-detail"></div>
+<div class="prompt-toolbar">
+  <button class="button secondary prompt-approve-btn" type="button">Approve once (y)</button>
+  <button class="button secondary prompt-deny-btn" type="button">Deny (n)</button>
+  <button class="button secondary prompt-enter-btn" type="button">Enter</button>
+</div>
+<div class="prompt-compose">
+  <input class="prompt-input" type="password" placeholder="Type a prompt response or password…" aria-label="Prompt response" autocomplete="off" spellcheck="false" />
+  <button class="button secondary prompt-secret-toggle" type="button" aria-label="Toggle password visibility">Show</button>
+  <button class="button prompt-send-btn" type="button" aria-label="Send prompt">Send prompt</button>
+</div>
+  </div>
+  </template>
+
+  <script src="/static/app.js"></script>
+  <div id="detailOverlay" class="detail-overlay"></div>
+  <div id="detailSheet" class="detail-sheet">
+<div class="detail-sheet-header">
+  <div class="detail-sheet-title" id="detailSheetTitle">Task details</div>
+  <button class="detail-sheet-close" id="detailSheetClose" type="button" aria-label="Close">&times;</button>
+</div>
+<div class="detail-sheet-body">
+  <input id="detailSheetTitleInput" class="inline-edit" type="text" placeholder="Task title…" style="display:none; margin-bottom:8px;" />
+  <textarea id="detailSheetBodyInput" class="inline-edit" placeholder="Task description…" style="display:none; min-height:120px; resize:vertical;"></textarea>
+  <pre id="detailSheetBody">Select a task to see details.</pre>
+  <div class="detail-actions" id="detailActions" style="display:none;">
+    <button class="button" id="detailSaveBtn" type="button">Save</button>
+    <button class="button secondary" id="detailCancelBtn" type="button">Cancel</button>
+    <button class="button secondary" id="detailEditBtn" type="button">Edit</button>
+    <button class="button secondary" id="detailDeleteBtn" type="button">Delete</button>
+    <div class="status-dropdown" id="detailStatusDropdown">
+      <button class="button secondary" id="detailStatusBtn" type="button">Change status</button>
+      <div class="status-dropdown-menu" id="detailStatusMenu"></div>
+    </div>
+  </div>
+</div>
+  </div>
+
+  <!-- Profile Editor Modal -->
+  <div id="profileEditorOverlay" class="profile-editor-overlay"></div>
+  <div id="profileEditorModal" class="profile-editor-modal">
+<div class="profile-editor-header">
+  <div class="profile-editor-title">Profile Editor</div>
+  <button class="profile-editor-close" id="profileEditorClose" type="button" aria-label="Close">&times;</button>
+</div>
+<div class="profile-editor-body">
+  <div class="profile-editor-sidebar" id="profileEditorSidebar"></div>
+  <div class="profile-editor-main">
+    <div class="profile-editor-form" id="profileEditorForm">
+      <label for="peName">Name</label>
+      <input id="peName" type="text" placeholder="profile name" />
+      <label for="peProvider">Provider</label>
+      <select id="peProvider">
+        <option value="">-- select provider --</option>
+        <option value="custom">Custom...</option>
+      </select>
+      <input id="peProviderCustom" type="text" placeholder="e.g. openrouter, nous" style="display:none" />
+      <label for="peModel">Default model</label>
+      <select id="peModel">
+        <option value="">-- select model --</option>
+        <option value="custom">Custom...</option>
+      </select>
+      <input id="peModelCustom" type="text" placeholder="e.g. openrouter/deepseek-v4-flash" style="display:none" />
+      <label for="peBaseUrl">Base URL</label>
+      <input id="peBaseUrl" type="text" placeholder="auto-filled when provider selected" />
+      <label for="peContext">Context length</label>
+      <input id="peContext" type="number" placeholder="e.g. 1048576" />
+      <label for="peApiMode">API mode</label>
+      <input id="peApiMode" type="text" placeholder="e.g. chat_completions" />
+      <label for="peReasoningEffort">Reasoning effort</label>
+      <select id="peReasoningEffort">
+        <option value="">default</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+      </select>
+      <label for="peReasoning">Show reasoning</label>
+      <select id="peReasoning">
+        <option value="">default</option>
+        <option value="off">off</option>
+        <option value="on">on</option>
+      </select>
+      <label for="peMaxTurns">Max turns</label>
+      <input id="peMaxTurns" type="number" placeholder="e.g. 90" />
+      <label for="pePersonality">Personality</label>
+      <select id="pePersonality">
+        <option value="">default</option>
+        <option value="kawaii">kawaii</option>
+        <option value="concise">concise</option>
+        <option value="technical">technical</option>
+        <option value="creative">creative</option>
+        <option value="helpful">helpful</option>
+        <option value="teacher">teacher</option>
+        <option value="noir">noir</option>
+        <option value="pirate">pirate</option>
+        <option value="shakespeare">shakespeare</option>
+        <option value="surfer">surfer</option>
+        <option value="catgirl">catgirl</option>
+        <option value="hype">hype</option>
+        <option value="uwu">uwu</option>
+        <option value="philosopher">philosopher</option>
+      </select>
+    </div>
+    <div class="profile-editor-actions">
+      <button class="button" id="peSaveBtn" type="button">Save profile</button>
+      <button class="button secondary" id="peCreateBtn" type="button">Create new</button>
+      <button class="button secondary" id="peDeleteBtn" type="button">Delete</button>
+    </div>
+    <div class="profile-editor-msg" id="peMsg"></div>
+  </div>
+</div>
+  </div>
+  <!-- Context Menu -->
+  <div id="contextMenu" class="context-menu">
+<div class="context-menu-item" data-action="edit">Edit title / body</div>
+<div class="context-menu-item" data-action="done">Mark done</div>
+<div class="context-menu-item" data-action="blocked">Mark blocked</div>
+<div class="context-menu-item" data-action="ready">Mark ready</div>
+<div class="context-menu-sep"></div>
+<div class="context-menu-item delete" data-action="delete">Delete</div>
+  </div>
+
+</body>
+</html>

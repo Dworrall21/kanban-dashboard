@@ -1,0 +1,4146 @@
+#!/usr/bin/env python3
+"""
+Hermes Kanban Browser — Mobile Web Dashboard with Chat.
+
+Decoupled architecture:
+  - Chat module: handles chat history persistence (client localStorage + server-side)
+  - Task module: handles task creation, accepts optional chat session reference
+  - Event bus: lightweight pub/sub for cross-module communication
+  - Server: separate endpoints for chat, task creation, and chat history sync
+"""
+import ast
+import json
+import os
+import queue
+import re
+import subprocess
+import sys
+import textwrap
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+import time
+import hashlib
+
+DEFAULT_BOARD = os.environ.get('HERMES_KANBAN_BOARD', 'mobile-web-dashboard-chat')
+DEFAULT_PROFILE = os.environ.get('HERMES_PROFILE', 'default')
+OVERSEER_PROFILE = os.environ.get('HERMES_OVERSEER_PROFILE', 'overseer')
+PORT = int(os.environ.get('KANBAN_BROWSER_PORT', '8799'))
+HERMES_HOME = Path(os.environ.get('HERMES_HOME', Path.home() / '.hermes'))
+BOARDS_ROOT = HERMES_HOME / 'kanban' / 'boards'
+TASK_RE = re.compile(r'^(?P<state>[✓●◻▶])\s+(?P<id>t_[0-9a-f]+)\s+(?P<status>\w+)\s+(?P<assignee>\S+)\s+(?P<title>.+)$')
+MODEL_LINE_RE = re.compile(r'^\s*Model:\s+(?P<model>\{.*\})\s*$')
+
+# ---------------------------------------------------------------------------
+# Simple TTL caches
+# ---------------------------------------------------------------------------
+_PROFILE_CACHE = {'profiles': None, 'current': None, 'ts': 0.0}
+_PROFILE_CACHE_TTL = 30.0
+_LIST_CACHE: dict[tuple[str, str], dict] = {}
+_LIST_CACHE_TTL = 2.5
+
+
+def _now() -> float:
+    return time.time()
+
+
+# ---------------------------------------------------------------------------
+# Event bus — thread-safe pub/sub for Server-Sent Events
+# ---------------------------------------------------------------------------
+
+class EventBus:
+    """Per-client-queue pub/sub so SSE connections receive events in real time."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._subscribers: dict[str, list[queue.Queue]] = {}
+
+    def subscribe(self, event_type: str) -> queue.Queue:
+        q: queue.Queue = queue.Queue(maxsize=64)
+        with self._lock:
+            self._subscribers.setdefault(event_type, []).append(q)
+        return q
+
+    def unsubscribe(self, event_type: str, q: queue.Queue) -> None:
+        with self._lock:
+            subs = self._subscribers.get(event_type)
+            if subs:
+                self._subscribers[event_type] = [s for s in subs if s is not q]
+
+    def emit(self, event_type: str, data: object) -> None:
+        with self._lock:
+            queues = list(self._subscribers.get(event_type, []))
+        for q in queues:
+            try:
+                q.put_nowait({'event': event_type, 'data': data})
+            except queue.Full:
+                pass  # slow client — drop event silently
+
+
+event_bus = EventBus()
+
+
+# ---------------------------------------------------------------------------
+# HTML / CSS / JS template
+
+HTML = r'''<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📋</text></svg>">
+  <title>Hermes Kanban Live</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; margin: 0; }
+    header { padding: 16px 20px; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+    main { display: contents; } /* inherit grid layout from parent */
+    h1 { margin: 0; font-size: 18px; color: #58a6ff; }
+    .meta { color: #8b949e; font-size: 12px; }
+    .wrap { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 16px; padding: 16px; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #21262d; font-size: 13px; }
+    th { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+    tr:hover { background: #0d1117; cursor: pointer; }
+    tr[draggable] { cursor: grab; }
+    tr[draggable]:active { cursor: grabbing; }
+    tr.dragging { opacity: 0.4; background: #0d1117; }
+    tr.drag-over { border-top: 2px solid #58a6ff; }
+    .status-done { color: #3fb950; }
+    .status-running { color: #58a6ff; }
+    .status-ready { color: #d29922; }
+    .status-todo { color: #8b949e; }
+    .status-blocked { color: #f85149; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; min-height: 360px; overflow: auto; }
+    .small { font-size: 12px; color: #8b949e; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #21262d; margin-left: 8px; font-size: 11px; color: #c9d1d9; }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .board-select { background: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; padding: 6px 8px; min-width: 240px; }
+    .button { background: #238636; color: white; border: 0; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+    .button:hover { background: #2ea043; }
+    .button.secondary { background: #21262d; }
+    .button.secondary:hover { background: #30363d; }
+
+    /* === Chat Composer === */
+    .chat-card          { margin: 0 16px 16px; }
+    .chat-head          { display:flex; justify-content:space-between; align-items:flex-start; gap: 12px; margin-bottom: 12px; }
+    .chat-title         { font-weight: 600; font-size: 14px; }
+    .chat-status        { color: #8b949e; font-size: 12px; }
+    .chat-detail        { color: #8b949e; font-size: 11px; line-height: 1.45; margin-top: 4px; white-space: pre-wrap; }
+    .chat-log           { display:flex; flex-direction:column; gap: 10px; max-height: 340px; overflow:auto; padding: 8px 4px 12px; border-top: 1px solid #21262d; border-bottom: 1px solid #21262d; }
+    .chat-msg           { border: 1px solid #30363d; border-radius: 10px; padding: 10px 12px; white-space: pre-wrap; word-break: break-word; }
+    .chat-msg.user      { background: #0d1117; align-self: flex-end; max-width: 85%; }
+    .chat-msg.assistant { background: #161b22; align-self: flex-start; max-width: 85%; }
+    .chat-msg.system    { background: #1f2937; color: #d1d5db; align-self: stretch; }
+    .chat-meta          { font-size: 11px; color: #8b949e; margin-bottom: 4px; }
+    /* ChatComposer: input area */
+    .chat-compose       { display:flex; flex-direction:column; gap: 10px; margin-top: 12px; align-items: stretch; }
+    .chat-input         { width: 100%; min-height: 80px; resize: vertical; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; padding: 10px; font: inherit; box-sizing: border-box; }
+    .chat-actions       { display:flex; flex-wrap:wrap; gap: 8px; }
+    /* ChatComposer: desktop side panel */
+    .chat-side          { display:flex; flex-direction:column; gap: 12px; }
+    /* ChatComposer: live output (streaming verbose log) */
+    .chat-live-wrap     { margin-top: 10px; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+    .chat-live-header   { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: #0d1117; border-bottom: 1px solid #30363d; cursor: pointer; user-select: none; }
+    .chat-live-label    { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: .05em; }
+    .chat-live-toggle   { font-size: 11px; color: #58a6ff; }
+    .chat-live          { background: #0d1117; color: #8b949e; font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 11px; line-height: 1.45; padding: 10px; max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+    .chat-live.collapsed { display: none; }
+    .chat-live .line     { display: block; }
+    .chat-live .line.err { color: #f85149; }
+    .chat-live .line.ok  { color: #3fb950; }
+    .chat-live .line.info{ color: #58a6ff; }
+
+    /* === Task Composer === */
+    .task-card          { margin: 0 16px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px; }
+    .task-head          { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:12px; }
+    .task-title         { font-weight:600; font-size:14px; }
+    .task-status        { color:#8b949e; font-size:12px; }
+    .task-detail        { color: #8b949e; font-size: 11px; line-height: 1.45; margin-top: 4px; white-space: pre-wrap; }
+    .task-profile-row   { display: flex; align-items: center; gap: 8px; margin: 8px 0 12px; padding: 8px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; }
+    .task-profile-row .board-select { min-width: 160px; }
+    .task-profile-row .task-profile-state { color: #8b949e; }
+    .task-compose       { display:flex; flex-direction:column; gap:10px; }
+    .task-input-row     { display:flex; gap:10px; align-items:stretch; }
+    .task-input         { flex:1; min-height:42px; background:#0d1117; color:#c9d1d9; border:1px solid #30363d; border-radius:8px; padding:10px; font:inherit; }
+    .task-title-input   { min-height:42px; resize:none; }
+    .task-body-input    { min-height:80px; resize:vertical; }
+    .task-actions       { display:flex; flex-wrap:wrap; gap:8px; }
+
+    /* === Prompt Composer === */
+    .prompt-card        { margin: 0 16px 16px; background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 14px; }
+    .prompt-head        { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:12px; }
+    .prompt-title       { font-weight:600; font-size:14px; }
+    .prompt-status      { color:#8b949e; font-size:12px; }
+    .prompt-detail      { color: #8b949e; font-size: 11px; line-height: 1.45; margin-top: 4px; white-space: pre-wrap; }
+    .prompt-toolbar     { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+    .prompt-toolbar .button.secondary { background:#21262d; }
+    .prompt-toolbar .button.secondary:hover { background:#30363d; }
+    .prompt-compose     { display:flex; gap:10px; align-items:stretch; }
+    .prompt-input       { flex:1; min-height:42px; background:#0d1117; color:#c9d1d9; border:1px solid #30363d; border-radius:8px; padding:10px; font:inherit; }
+    .prompt-secret-toggle { min-width:72px; }
+
+    /* Bottom sheet overlay for mobile task detail */
+    .detail-overlay { display: none; position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,0.5); opacity: 0; transition: opacity .25s ease; }
+    .detail-overlay.open { display: block; opacity: 1; }
+    .detail-sheet { position: fixed; left: 0; right: 0; bottom: 0; z-index: 101; background: #161b22; border: 1px solid #30363d; border-radius: 16px 16px 0 0; box-shadow: 0 -4px 24px rgba(0,0,0,0.4); transform: translateY(100%); transition: transform .3s cubic-bezier(0.4, 0, 0.2, 1); max-height: 80vh; display: flex; flex-direction: column; }
+    .detail-sheet.open { transform: translateY(0); }
+    .detail-sheet-header { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; border-bottom: 1px solid #30363d; flex-shrink: 0; }
+    .detail-sheet-title { font-weight: 600; font-size: 14px; color: #c9d1d9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: calc(100% - 40px); }
+    .detail-sheet-close { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 18px; line-height: 1; flex-shrink: 0; }
+    .detail-sheet-close:hover { background: #30363d; }
+    .detail-sheet-body { padding: 14px 16px; overflow: auto; flex: 1; }
+    .detail-sheet-body pre { min-height: 0; max-height: none; margin: 0; }
+
+    @media (max-width: 768px) {
+      .wrap { grid-template-columns: 1fr; }
+      .chat-side { display: none; }
+      .chat-compose { position: sticky; bottom: 0; background: #161b22; border-top: 1px solid #30363d; padding: 12px 0 0; margin-top: 0; }
+      .button, .board-select { min-height: 44px; }
+      td, th { padding: 12px 8px; }
+      .session-panel { width: 100vw; max-width: 100vw; border-radius: 0; left: 0; right: 0; top: 0; bottom: 0; max-height: 100vh; }
+
+      /* Stack header vertically on mobile */
+      header { flex-direction: column; align-items: stretch; gap: 8px; padding: 12px 16px; }
+      header .toolbar { flex-direction: column; gap: 6px; }
+      header .toolbar .board-select { width: 100%; min-width: 0; }
+      header .toolbar .button { width: 100%; text-align: center; }
+      header .toolbar .small { align-self: flex-start; }
+
+      /* Full-width cards on mobile */
+      .chat-card,
+      .task-card,
+      .prompt-card { margin-left: 0; margin-right: 0; border-radius: 0; border-left: none; border-right: none; }
+
+      /* Kanban mobile: stack columns vertically */
+      .kanban-board.active { flex-direction: column; overflow-x: visible; padding: 8px 0; gap: 8px; }
+      .kanban-column { min-width: 0; }
+      .kanban-column-body { min-height: 60px; }
+      .kanban-card { padding: 10px; }
+    }
+
+    /* === Profile Editor === */
+    .profile-editor-overlay { display: none; position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,0.6); opacity: 0; transition: opacity .25s ease; }
+    .profile-editor-overlay.open { display: block; opacity: 1; }
+    .profile-editor-modal { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%) scale(0.96); z-index: 201; background: #161b22; border: 1px solid #30363d; border-radius: 12px; width: min(900px, 94vw); height: min(720px, 90vh); display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.5); opacity: 0; transition: opacity .2s ease, transform .2s ease; pointer-events: none; }
+    .profile-editor-overlay.open + .profile-editor-modal, .profile-editor-modal.open { opacity: 1; transform: translate(-50%, -50%) scale(1); pointer-events: auto; }
+    .profile-editor-header { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-bottom: 1px solid #30363d; flex-shrink: 0; }
+    .profile-editor-title { font-weight: 600; font-size: 15px; }
+    .profile-editor-close { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 18px; line-height: 1; }
+    .profile-editor-close:hover { background: #30363d; }
+    .profile-editor-body { display: flex; flex: 1; overflow: hidden; }
+    .profile-editor-sidebar { width: 220px; border-right: 1px solid #30363d; overflow-y: auto; padding: 10px 0; flex-shrink: 0; }
+    .profile-editor-sidebar-item { padding: 10px 16px; cursor: pointer; font-size: 13px; color: #c9d1d9; display: flex; justify-content: space-between; align-items: center; }
+    .profile-editor-sidebar-item:hover { background: #0d1117; }
+    .profile-editor-sidebar-item.active { background: #21262d; border-left: 3px solid #58a6ff; }
+    .profile-editor-main { flex: 1; padding: 16px 20px; overflow-y: auto; }
+    .profile-editor-form { display: grid; grid-template-columns: 140px 1fr; gap: 12px 16px; align-items: center; }
+    .profile-editor-form label { font-size: 12px; color: #8b949e; text-align: right; }
+    .profile-editor-form input, .profile-editor-form select { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; padding: 8px 10px; font: inherit; }
+    .profile-editor-form input[readonly] { opacity: 0.6; cursor: not-allowed; }
+    .profile-editor-actions { display: flex; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid #30363d; }
+    .profile-editor-msg { font-size: 12px; margin-top: 10px; min-height: 18px; }
+    .profile-editor-msg.ok { color: #3fb950; }
+    .profile-editor-msg.err { color: #f85149; }
+
+    /* === Context Menu === */
+    .context-menu { position: fixed; z-index: 300; background: #161b22; border: 1px solid #30363d; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); min-width: 180px; padding: 6px 0; display: none; }
+    .context-menu.open { display: block; }
+    .context-menu-item { padding: 8px 14px; font-size: 13px; color: #c9d1d9; cursor: pointer; display: flex; align-items: center; gap: 8px; }
+    .context-menu-item:hover { background: #0d1117; }
+    .context-menu-item.delete { color: #f85149; }
+    .context-menu-item.delete:hover { background: rgba(248,81,73,0.1); }
+    .context-menu-sep { height: 1px; background: #30363d; margin: 6px 0; }
+
+    /* === Status Dropdown === */
+    .status-dropdown { position: relative; display: inline-block; }
+    .status-dropdown-menu { position: absolute; top: 100%; left: 0; z-index: 50; background: #161b22; border: 1px solid #30363d; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); min-width: 140px; padding: 6px 0; display: none; }
+    .status-dropdown.open .status-dropdown-menu { display: block; }
+    .status-dropdown-item { padding: 6px 12px; font-size: 12px; color: #c9d1d9; cursor: pointer; }
+    .status-dropdown-item:hover { background: #0d1117; }
+    .status-dropdown-item.active { background: #21262d; }
+
+    /* === Inline Edit === */
+    .inline-edit { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; padding: 8px; font: inherit; width: 100%; box-sizing: border-box; }
+    .inline-edit:focus { outline: none; border-color: #58a6ff; }
+    .detail-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+    .detail-actions .button { font-size: 12px; padding: 5px 10px; }
+
+    /* === View Toggle === */
+    .view-toggle { display: flex; gap: 0; }
+    .view-toggle button { background: #21262d; color: #8b949e; border: 1px solid #30363d; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+    .view-toggle button:first-child { border-radius: 6px 0 0 6px; }
+    .view-toggle button:last-child { border-radius: 0 6px 6px 0; }
+    .view-toggle button.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+
+    /* === Kanban Board === */
+    .kanban-board { display: none; }
+    .kanban-board.active { display: flex; gap: 12px; padding: 12px 0; overflow-x: auto; min-height: 240px; }
+    .kanban-column { flex: 1; min-width: 220px; background: #0d1117; border: 1px solid #30363d; border-radius: 10px; display: flex; flex-direction: column; }
+    .kanban-column-header { padding: 10px 12px; border-bottom: 1px solid #30363d; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; display: flex; justify-content: space-between; align-items: center; }
+    .kanban-column-header .count { color: #8b949e; font-size: 11px; background: #21262d; padding: 1px 7px; border-radius: 999px; }
+    .kanban-column-body { padding: 8px; flex: 1; min-height: 80px; transition: background .15s ease; }
+    .kanban-column-body.drag-over { background: #161b22; border-radius: 8px; }
+    .kanban-column.todo .kanban-column-header { color: #8b949e; }
+    .kanban-column.running .kanban-column-header { color: #58a6ff; }
+    .kanban-column.done .kanban-column-header { color: #3fb950; }
+    .kanban-column.blocked .kanban-column-header { color: #f85149; }
+
+    .kanban-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; cursor: grab; transition: box-shadow .15s ease, opacity .15s ease; user-select: none; }
+    .kanban-card:hover { border-color: #58a6ff; }
+    .kanban-card:active { cursor: grabbing; }
+    .kanban-card.dragging { opacity: 0.4; }
+    .kanban-card .card-title { font-size: 13px; color: #c9d1d9; font-weight: 500; line-height: 1.4; margin-bottom: 6px; word-break: break-word; }
+    .kanban-card .card-meta { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 11px; color: #8b949e; }
+    .kanban-card .card-id { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 10px; color: #484f58; }
+    .kanban-card .card-assignee { background: #21262d; padding: 1px 6px; border-radius: 4px; color: #8b949e; font-size: 10px; }
+    .kanban-card .card-preview { font-size: 11px; color: #484f58; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .kanban-card .card-status-badge { font-size: 10px; padding: 1px 6px; border-radius: 999px; }
+    .kanban-card .card-status-badge.todo { color: #8b949e; background: rgba(139,148,158,0.12); }
+    .kanban-card .card-status-badge.ready { color: #d29922; background: rgba(210,153,34,0.12); }
+    .kanban-card .card-status-badge.running { color: #58a6ff; background: rgba(88,166,255,0.12); }
+    .kanban-card .card-status-badge.done { color: #3fb950; background: rgba(63,185,80,0.12); }
+    .kanban-card .card-status-badge.blocked { color: #f85149; background: rgba(248,81,73,0.12); }
+
+    /* Ghost drag image helper */
+    .kanban-drag-ghost { position: fixed; pointer-events: none; z-index: 1000; background: #161b22; border: 1px solid #58a6ff; border-radius: 8px; padding: 10px 12px; font-size: 13px; color: #c9d1d9; box-shadow: 0 8px 24px rgba(0,0,0,0.4); max-width: 280px; opacity: 0.95; transform: rotate(2deg); }
+
+    /* Hide table when board view is active */
+    .table-view-container.active { display: block; }
+    .table-view-container.hidden { display: none; }
+
+    @media (max-width: 768px) {
+      .profile-editor-modal { width: 100vw; height: 100vh; border-radius: 0; border: 0; }
+      .profile-editor-body { flex-direction: column; }
+      .profile-editor-sidebar { width: auto; border-right: none; border-bottom: 1px solid #30363d; max-height: 160px; }
+      .profile-editor-form { grid-template-columns: 1fr; }
+      .profile-editor-form label { text-align: left; }
+    }
+    /* === Session Panel & Export Menu === */
+    .chat-session-bar { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; position: relative; }
+    .chat-session-badge { font-size: 11px; color: #8b949e; background: #0d1117; border: 1px solid #30363d; border-radius: 999px; padding: 2px 8px; }
+    .chat-export-menu { display: none; position: absolute; top: 100%; right: 0; z-index: 50; background: #161b22; border: 1px solid #30363d; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); min-width: 160px; padding: 6px 0; }
+    .chat-export-menu.open { display: block; }
+    .chat-export-option { padding: 8px 14px; font-size: 13px; color: #c9d1d9; cursor: pointer; }
+    .chat-export-option:hover { background: #0d1117; }
+
+    .session-overlay { display: none; position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,0.5); }
+    .session-overlay.open { display: block; }
+    .session-panel { display: none; position: fixed; right: 16px; top: 60px; z-index: 201; background: #161b22; border: 1px solid #30363d; border-radius: 12px; width: min(420px, 94vw); max-height: 70vh; box-shadow: 0 20px 60px rgba(0,0,0,0.5); flex-direction: column; overflow: hidden; }
+    .session-panel.open { display: flex; }
+    .session-panel-header { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; border-bottom: 1px solid #30363d; flex-shrink: 0; }
+    .session-panel-title { font-weight: 600; font-size: 14px; color: #c9d1d9; }
+    .session-panel-close { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 18px; line-height: 1; }
+    .session-panel-close:hover { background: #30363d; }
+    .session-panel-body { overflow-y: auto; padding: 8px 0; flex: 1; }
+    .session-item { padding: 10px 14px; border-bottom: 1px solid #21262d; cursor: pointer; }
+    .session-item:hover { background: #0d1117; }
+    .session-item.current { background: #1a2332; border-left: 3px solid #58a6ff; }
+    .session-item-name { font-size: 13px; color: #c9d1d9; font-weight: 500; display: flex; justify-content: space-between; align-items: center; }
+    .session-item-meta { font-size: 11px; color: #8b949e; margin-top: 3px; }
+    .session-item-preview { font-size: 11px; color: #8b949e; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .session-item-actions { display: flex; gap: 6px; margin-top: 6px; }
+    .session-item-actions .button { font-size: 11px; padding: 2px 8px; }
+    .session-loading { padding: 20px; text-align: center; color: #8b949e; font-size: 13px; }
+    .session-empty { padding: 20px; text-align: center; color: #8b949e; font-size: 13px; }
+    .session-rename-input { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 4px 8px; font-size: 13px; width: 100%; box-sizing: border-box; }
+
+    /* === Task Search, Filter & Sort === */
+    .search-bar { width: 100%; padding: 8px 16px 4px; box-sizing: border-box; }
+    .search-input { width: 100%; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; padding: 8px 12px; font: inherit; font-size: 13px; box-sizing: border-box; }
+    .search-input:focus { outline: none; border-color: #58a6ff; }
+    .search-input::placeholder { color: #484f58; }
+    .filter-row { display: flex; align-items: center; gap: 6px; padding: 4px 16px 8px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+    .filter-row::-webkit-scrollbar { display: none; }
+    .filter-chip { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 999px; background: #21262d; border: 1px solid #30363d; color: #8b949e; font-size: 11px; cursor: pointer; white-space: nowrap; user-select: none; transition: background .15s, border-color .15s, color .15s; flex-shrink: 0; }
+    .filter-chip:hover { background: #30363d; border-color: #484f58; color: #c9d1d9; }
+    .filter-chip.active { background: #1f3a5f; border-color: #58a6ff; color: #58a6ff; }
+    .filter-chip .chip-count { display: inline-flex; align-items: center; justify-content: center; min-width: 16px; height: 16px; border-radius: 999px; background: rgba(88,166,255,0.15); color: #58a6ff; font-size: 10px; font-weight: 600; padding: 0 4px; }
+    .filter-chip.active .chip-count { background: rgba(88,166,255,0.25); }
+    .sort-group { display: flex; align-items: center; gap: 6px; margin-left: auto; flex-shrink: 0; }
+    .sort-select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; padding: 4px 8px; font-size: 11px; cursor: pointer; }
+    .sort-toggle { background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 8px; padding: 4px 8px; font-size: 11px; cursor: pointer; display: flex; align-items: center; gap: 2px; }
+    .sort-toggle:hover { background: #30363d; color: #c9d1d9; }
+    .sort-toggle.active { color: #58a6ff; border-color: #58a6ff; }
+    .filter-row .small-label { font-size: 11px; color: #484f58; flex-shrink: 0; }
+
+    @media (max-width: 768px) {
+      .search-bar { padding: 6px 12px 2px; }
+      .search-input { font-size: 16px; padding: 10px 12px; }
+      .filter-row { padding: 2px 12px 6px; gap: 4px; }
+      .filter-chip { padding: 6px 12px; font-size: 12px; }
+      .sort-group { margin-left: 0; }
+      header .filter-row { flex-wrap: nowrap; }
+    }
+  </style>
+</head>
+<body>
+    <header role="banner">
+    <div>
+      <h1>Hermes Kanban Live <span class="pill" id="boardName">''' + DEFAULT_BOARD + r'''</span></h1>
+      <div class="meta" id="summary">Loading…</div>
+    </div>
+    <div class="toolbar">
+      <label class="small" for="boardSelect">Board</label>
+      <select id="boardSelect" class="board-select"></select>
+      <label class="small" for="profileSelect">Profile</label>
+      <select id="profileSelect" class="board-select"></select>
+      <button class="button secondary" id="profileConfirmBtn" type="button">Profile active</button>
+      <span class="small" id="profileState">Active: default</span>
+      <button class="button secondary" id="editProfilesBtn" type="button">Edit profiles</button>
+      <div class="view-toggle" id="viewToggle">
+        <button class="active" data-view="table" title="Table view">Table</button>
+        <button data-view="board" title="Board view">Board</button>
+      </div>
+      <button class="button" id="refreshBtn" type="button">Refresh</button>
+      <div class="small" id="sseStatus">live via SSE</div>
+    </div>
+    <div class="search-bar">
+      <input type="text" id="searchInput" class="search-input" placeholder="🔍 Search tasks by title or ID…" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="filter-row" id="filterRow">
+      <span class="small-label">Filter:</span>
+      <span class="filter-chip active" data-status="all" id="chip-all">All</span>
+      <span class="filter-chip" data-status="ready" id="chip-ready">Ready <span class="chip-count" id="count-ready">0</span></span>
+      <span class="filter-chip" data-status="running" id="chip-running">Running <span class="chip-count" id="count-running">0</span></span>
+      <span class="filter-chip" data-status="done" id="chip-done">Done <span class="chip-count" id="count-done">0</span></span>
+      <span class="filter-chip" data-status="blocked" id="chip-blocked">Blocked <span class="chip-count" id="count-blocked">0</span></span>
+      <span class="filter-chip" data-status="todo" id="chip-todo">Todo <span class="chip-count" id="count-todo">0</span></span>
+      <div class="sort-group">
+        <select id="sortSelect" class="sort-select">
+          <option value="created">Date</option>
+          <option value="title">Title</option>
+          <option value="status">Status</option>
+        </select>
+        <span class="sort-toggle" id="sortDirToggle" title="Toggle sort direction">▲</span>
+      </div>
+    </div>
+  </header>
+  <main><div class="wrap">
+    <div class="table-view-container active" id="tableView">
+      <div class="card">
+        <table>
+          <thead>
+            <tr><th>Status</th><th>Task</th><th>Assignee</th><th>Title</th></tr>
+          </thead>
+          <tbody id="tasks"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="kanban-board" id="kanbanBoard">
+      <div class="kanban-column todo" data-status="todo">
+        <div class="kanban-column-header">To Do <span class="count" id="count-todo-board">0</span></div>
+        <div class="kanban-column-body" id="col-todo"></div>
+      </div>
+      <div class="kanban-column ready" data-status="ready">
+        <div class="kanban-column-header">Ready <span class="count" id="count-ready-board">0</span></div>
+        <div class="kanban-column-body" id="col-ready"></div>
+      </div>
+      <div class="kanban-column running" data-status="running">
+        <div class="kanban-column-header">Running <span class="count" id="count-running-board">0</span></div>
+        <div class="kanban-column-body" id="col-running"></div>
+      </div>
+      <div class="kanban-column done" data-status="done">
+        <div class="kanban-column-header">Done <span class="count" id="count-done-board">0</span></div>
+        <div class="kanban-column-body" id="col-done"></div>
+      </div>
+      <div class="kanban-column blocked" data-status="blocked">
+        <div class="kanban-column-header">Blocked <span class="count" id="count-blocked-board">0</span></div>
+        <div class="kanban-column-body" id="col-blocked"></div>
+      </div>
+    </div>
+    <div class="card chat-side">
+      <div class="small" id="detailsLabel">Select a task</div>
+      <pre id="details">Click a task to see details.</pre>
+    </div>
+    </div>
+  </main>
+
+  <!-- Chat card: standalone module, no task dependency -->
+  <div id="chatComposerMount"></div>
+
+  <!-- Task creation card: standalone module, no chat dependency -->
+  <div id="taskComposerMount"></div>
+
+  <!-- Prompt response card -->
+  <div id="promptComposerMount"></div>
+
+  <!-- ===== Component Templates ===== -->
+
+  <template id="tpl-chat-composer">
+  <div class="card chat-card">
+    <div class="chat-head">
+      <div>
+        <div class="chat-title">Project chat</div>
+        <div class="small">Direct the selected board/profile with instructions and follow-up questions.</div>
+      </div>
+      <div>
+        <div class="chat-status">Ready</div>
+        <div class="chat-session-name small" style="cursor:pointer;color:#58a6ff;margin-top:2px;" title="Click to manage sessions">Session: ...</div>
+      </div>
+    </div>
+    <div class="chat-session-bar">
+      <span class="chat-session-badge" id="chatSessionBadge">...</span>
+      <button class="button secondary chat-sessions-btn" type="button" aria-label="Sessions" title="Manage sessions">Sessions</button>
+      <button class="button secondary chat-export-btn" type="button" aria-label="Export chat" title="Export chat">Export</button>
+      <div class="chat-export-menu" id="chatExportMenu">
+        <div class="chat-export-option" data-format="json">Export as JSON</div>
+        <div class="chat-export-option" data-format="markdown">Export as Markdown</div>
+      </div>
+    </div>
+    <div class="chat-detail"></div>
+    <div class="chat-log"></div>
+    <div class="chat-compose">
+      <textarea class="chat-input" placeholder="Tell the selected project what to do next…" aria-label="Message input"></textarea>
+      <div class="chat-actions">
+        <button class="button chat-send-btn" type="button" aria-label="Send message">Send</button>
+        <button class="button secondary chat-clear-btn" type="button" aria-label="Clear chat history">New session</button>
+      </div>
+    </div>
+    <div class="chat-live-wrap">
+      <div class="chat-live-header">
+        <span class="chat-live-label">Agent log</span>
+        <span class="chat-live-toggle">Show</span>
+      </div>
+      <pre class="chat-live collapsed"></pre>
+    </div>
+  </div>
+  <!-- Session Manager Panel -->
+  <div id="chatSessionOverlay" class="session-overlay"></div>
+  <div id="chatSessionPanel" class="session-panel">
+    <div class="session-panel-header">
+      <span class="session-panel-title">Chat Sessions</span>
+      <button class="session-panel-close" id="chatSessionPanelClose" type="button">&times;</button>
+    </div>
+    <div class="session-panel-body" id="chatSessionList">
+      <div class="session-loading">Loading sessions...</div>
+    </div>
+  </div>
+  </template>
+
+  <template id="tpl-task-composer">
+  <div class="card task-card">
+    <div class="task-head">
+      <div>
+        <div class="task-title">Create task</div>
+        <div class="small">Create a kanban task. Optionally link it to the current chat session.</div>
+      </div>
+      <div class="task-status">Ready</div>
+    </div>
+    <div class="task-detail"></div>
+    <div class="task-profile-row">
+      <label class="small">Delegate as</label>
+      <select class="task-profile-select board-select" aria-label="Delegate profile"></select>
+      <button class="button secondary task-profile-confirm-btn" type="button">Profile active</button>
+      <span class="small task-profile-state">overseer</span>
+    </div>
+    <div class="task-compose">
+      <input class="task-input task-title-input" type="text" placeholder="Task title…" aria-label="Task title" autocomplete="off" spellcheck="false" />
+      <textarea class="task-input task-body-input" placeholder="Task description / instructions…" aria-label="Task description"></textarea>
+      <div class="task-actions">
+        <button class="button task-create-btn" type="button">Create task</button>
+        <button class="button secondary task-from-selection-btn" type="button">Create from selected</button>
+        <button class="button secondary task-from-chat-btn" type="button">Attach chat session</button>
+      </div>
+    </div>
+  </div>
+  </template>
+
+  <template id="tpl-prompt-composer">
+  <div class="card prompt-card">
+    <div class="prompt-head">
+      <div>
+        <div class="prompt-title">Prompt response</div>
+        <div class="small">Quick replies for approvals, sudo prompts, and other live responses.</div>
+      </div>
+      <div class="prompt-status">Ready</div>
+    </div>
+    <div class="prompt-detail"></div>
+    <div class="prompt-toolbar">
+      <button class="button secondary prompt-approve-btn" type="button">Approve once (y)</button>
+      <button class="button secondary prompt-deny-btn" type="button">Deny (n)</button>
+      <button class="button secondary prompt-enter-btn" type="button">Enter</button>
+    </div>
+    <div class="prompt-compose">
+      <input class="prompt-input" type="password" placeholder="Type a prompt response or password…" aria-label="Prompt response" autocomplete="off" spellcheck="false" />
+      <button class="button secondary prompt-secret-toggle" type="button" aria-label="Toggle password visibility">Show</button>
+      <button class="button prompt-send-btn" type="button" aria-label="Send prompt">Send prompt</button>
+    </div>
+  </div>
+  </template>
+
+<script>
+// ============================================================================
+// Event Bus — lightweight pub/sub for decoupled module communication
+// ============================================================================
+const bus = (() => {
+  const listeners = {};
+  return {
+    on(event, fn) {
+      (listeners[event] = listeners[event] || []).push(fn);
+    },
+    off(event, fn) {
+      if (!listeners[event]) return;
+      listeners[event] = listeners[event].filter(h => h !== fn);
+    },
+    emit(event, data) {
+      for (const fn of (listeners[event] || [])) {
+        try { fn(data); } catch (_) { /* ignore handler errors */ }
+      }
+    },
+  };
+})();
+
+// ============================================================================
+// State — shared configuration (not module-internal state)
+// ============================================================================
+let selected = null;
+let currentBoard = new URLSearchParams(window.location.search).get('board') || 'mobile-web-dashboard-chat';
+let currentProfile = new URLSearchParams(window.location.search).get('profile') || 'default';
+let pendingProfile = currentProfile;
+const OVERSEER_PROFILE = 'overseer';
+let chatSessionId = null;  // set after first chat message, used to link tasks
+
+// ---- Filter / Search / Sort state ----
+let filterStatus = new URLSearchParams(window.location.search).get('filter') || 'all';
+let filterQuery = new URLSearchParams(window.location.search).get('q') || '';
+let sortBy = new URLSearchParams(window.location.search).get('sort') || 'created';
+let sortAsc = new URLSearchParams(window.location.search).get('dir') === 'asc';
+let allTasks = [];  // cache the full task list from the last refresh
+
+function syncUrl() {
+  const url = new URL(window.location.href);
+  if (currentBoard) url.searchParams.set('board', currentBoard); else url.searchParams.delete('board');
+  if (currentProfile) url.searchParams.set('profile', currentProfile); else url.searchParams.delete('profile');
+  if (filterStatus && filterStatus !== 'all') url.searchParams.set('filter', filterStatus); else url.searchParams.delete('filter');
+  if (filterQuery) url.searchParams.set('q', filterQuery); else url.searchParams.delete('q');
+  if (sortBy && sortBy !== 'created') url.searchParams.set('sort', sortBy); else url.searchParams.delete('sort');
+  if (sortAsc) url.searchParams.set('dir', 'asc'); else url.searchParams.delete('dir');
+  window.history.replaceState({}, '', url.toString());
+}
+
+async function api(path, params = {}, method = 'GET', body = null) {
+  const url = new URL(path, window.location.origin);
+  if (currentBoard) url.searchParams.set('board', currentBoard);
+  if (currentProfile) url.searchParams.set('profile', currentProfile);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
+  }
+  const opts = { method, headers: {} };
+  if (body !== null) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  return fetch(url.toString(), opts);
+}
+
+// ============================================================================
+// Chat Module — mounts from template, owns its DOM via this.root
+// ============================================================================
+const chat = (() => {
+  let history = [];
+  let root = null;
+  let currentSessionId = chatSessionId;
+  let _sessions = [];  // cached session list
+
+  function q(sel) { return root ? root.querySelector(sel) : null; }
+  function qAll(sel) { return root ? root.querySelectorAll(sel) : []; }
+
+  function storageKey() {
+    return `kanban-chat-sessions:${currentBoard || 'mobile-web-dashboard-chat'}`;
+  }
+
+  function oldStorageKey() {
+    return `kanban-chat-history:${currentBoard || 'mobile-web-dashboard-chat'}`;
+  }
+
+  function sessionsStorageKey() {
+    return `kanban-chat-sessions-meta:${currentBoard || 'mobile-web-dashboard-chat'}`;
+  }
+
+  function hashString(s) {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) {
+      h = ((h << 5) - h) + s.charCodeAt(i);
+      h |= 0;
+    }
+    return h;
+  }
+
+  function loadFromStorage() {
+    try {
+      // Migrate from old key format
+      const oldKey = oldStorageKey();
+      const oldRaw = localStorage.getItem(oldKey);
+      const newKey = storageKey();
+      if (oldRaw && !localStorage.getItem(newKey)) {
+        localStorage.setItem(newKey, oldRaw);
+        localStorage.removeItem(oldKey);
+      }
+      const raw = localStorage.getItem(newKey);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      // Support both legacy array and new session format
+      if (Array.isArray(parsed)) return parsed.filter(Boolean);
+      return [];
+    } catch (_) { return []; }
+  }
+
+  function saveToStorage() {
+    try { localStorage.setItem(storageKey(), JSON.stringify(history.slice(-60))); } catch (_) {}
+  }
+
+  function loadSessionsMeta() {
+    try {
+      const raw = localStorage.getItem(sessionsStorageKey());
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (_) { return []; }
+  }
+
+  function saveSessionsMeta(sessions) {
+    try { localStorage.setItem(sessionsStorageKey(), JSON.stringify(sessions)); } catch (_) {}
+  }
+
+  function render() {
+    const log = q('.chat-log');
+    if (!log) return;
+    log.innerHTML = '';
+    for (const msg of history) {
+      const wrap = document.createElement('div');
+      wrap.className = `chat-msg ${msg.role}`;
+      const meta = document.createElement('div');
+      meta.className = 'chat-meta';
+      meta.textContent = msg.role === 'user' ? 'You' : msg.role === 'assistant' ? 'Hermes' : 'System';
+      const body = document.createElement('div');
+      body.textContent = msg.content;
+      wrap.appendChild(meta);
+      wrap.appendChild(body);
+      log.appendChild(wrap);
+    }
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function statusDetail() {
+    const turns = history.filter(m => m.role === 'user' || m.role === 'assistant').length;
+    const lastUser = [...history].reverse().find(m => m.role === 'user');
+    const lastAssistant = [...history].reverse().find(m => m.role === 'assistant');
+    const clip = (msg) => {
+      if (!msg) return 'none';
+      return String(msg.content || '').replace(/\s+/g, ' ').trim().slice(0, 140) || 'none';
+    };
+    return [
+      `board=${currentBoard}`,
+      `profile=${currentProfile}${pendingProfile && pendingProfile !== currentProfile ? ` (staged=${pendingProfile})` : ''}`,
+      `session=${currentSessionId || 'none'}`,
+      `turns=${turns}`,
+      `last_user=${clip(lastUser)}`,
+      `last_assistant=${clip(lastAssistant)}`,
+    ].join(' | ');
+  }
+
+  function setStatus(text) {
+    const el = q('.chat-status');
+    if (el) el.textContent = text;
+  }
+
+  function setDetail(text) {
+    const el = q('.chat-detail');
+    if (el) el.textContent = text;
+  }
+
+  function liveLog() { return q('.chat-live'); }
+  function liveWrap() { return q('.chat-live-wrap'); }
+  function liveHeader() { return q('.chat-live-header'); }
+  function liveToggle() { return q('.chat-live-toggle'); }
+
+  function appendLiveLine(text, cls) {
+    const live = liveLog();
+    if (!live) return;
+    const span = document.createElement('span');
+    span.className = 'line' + (cls ? ' ' + cls : '');
+    span.textContent = text;
+    live.appendChild(span);
+    live.scrollTop = live.scrollHeight;
+  }
+
+  function clearLive() {
+    const live = liveLog();
+    if (live) live.innerHTML = '';
+  }
+
+  function expandLive() {
+    const live = liveLog();
+    const toggle = liveToggle();
+    if (live) live.classList.remove('collapsed');
+    if (toggle) toggle.textContent = 'Hide';
+  }
+
+  function collapseLive() {
+    const live = liveLog();
+    const toggle = liveToggle();
+    if (live) live.classList.add('collapsed');
+    if (toggle) toggle.textContent = 'Show';
+  }
+
+  function updateSessionBadge() {
+    const badge = q('#chatSessionBadge');
+    const nameEl = q('.chat-session-name');
+    if (badge) {
+      const sessionData = _sessions.find(s => s.id === currentSessionId);
+      const label = sessionData ? (sessionData.name || sessionData.id) : (currentSessionId || 'new');
+      const shortId = currentSessionId ? currentSessionId.slice(0, 8) : 'new';
+      badge.textContent = `${history.length} msgs · ${shortId}`;
+    }
+    if (nameEl) {
+      const sessionData = _sessions.find(s => s.id === currentSessionId);
+      nameEl.textContent = sessionData ? `Session: ${sessionData.name || sessionData.id}` : 'Session: new';
+    }
+  }
+
+  async function loadSessionsFromServer() {
+    try {
+      const r = await api('/api/chat-sessions');
+      const d = await r.json();
+      _sessions = Array.isArray(d.sessions) ? d.sessions : [];
+      saveSessionsMeta(_sessions);
+      return _sessions;
+    } catch (_) {
+      _sessions = loadSessionsMeta();
+      return _sessions;
+    }
+  }
+
+  async function switchSession(sessionId) {
+    try {
+      const r = await api('/api/chat-sessions/switch', {}, 'POST', {
+        board: currentBoard,
+        session_id: sessionId,
+      });
+      const d = await r.json();
+      if (d.switched) {
+        history = Array.isArray(d.history) ? d.history : [];
+        currentSessionId = sessionId;
+        chatSessionId = sessionId;
+        saveToStorage();
+        render();
+        setStatus('Ready');
+        setDetail(statusDetail());
+        updateSessionBadge();
+        await loadSessionsFromServer();
+        renderSessionPanel();
+        closeSessionPanel();
+        bus.emit('chat:session-switched', { session_id: sessionId });
+      }
+    } catch (err) {
+      console.error('Failed to switch session:', err);
+    }
+  }
+
+  async function renameSession(sessionId, newName) {
+    try {
+      const r = await api('/api/chat-sessions', {}, 'POST', {
+        board: currentBoard,
+        action: 'rename',
+        session_id: sessionId,
+        name: newName,
+      });
+      const d = await r.json();
+      if (d.renamed) {
+        await loadSessionsFromServer();
+        renderSessionPanel();
+        updateSessionBadge();
+      }
+    } catch (err) {
+      console.error('Failed to rename session:', err);
+    }
+  }
+
+  async function deleteSession(sessionId) {
+    if (!confirm(`Delete this session and all its messages? This cannot be undone.`)) return;
+    try {
+      const r = await api('/api/chat-sessions', { session: sessionId }, 'DELETE');
+      const d = await r.json();
+      if (d.deleted) {
+        if (currentSessionId === sessionId) {
+          // Switch to current session from server
+          const newCurrent = d.current_session;
+          if (newCurrent) {
+            await switchSession(newCurrent);
+          } else {
+            history = [];
+            currentSessionId = null;
+            chatSessionId = null;
+            saveToStorage();
+            render();
+            setStatus('Ready');
+            setDetail(statusDetail());
+            updateSessionBadge();
+          }
+        }
+        await loadSessionsFromServer();
+        renderSessionPanel();
+      }
+    } catch (err) {
+      console.error('Failed to delete session:', err);
+    }
+  }
+
+  function downloadExport(data, filename, mimeType) {
+    const blob = new Blob([data], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  async function exportSession(format) {
+    const params = { format: format };
+    if (currentSessionId) params.session = currentSessionId;
+    try {
+      const r = await api('/api/chat-export', params);
+      if (!r.ok) { alert('Export failed'); return; }
+      const blob = await r.blob();
+      const disposition = r.headers.get('Content-Disposition') || '';
+      const match = disposition.match(/filename="?([^"]+)"?/);
+      const filename = match ? match[1] : `chat-export.${format === 'markdown' ? 'md' : 'json'}`;
+      downloadExport(blob, filename, r.headers.get('Content-Type') || 'application/octet-stream');
+    } catch (err) {
+      console.error('Export failed:', err);
+      alert('Export failed');
+    }
+  }
+
+  function renderSessionPanel() {
+    const list = document.getElementById('chatSessionList');
+    if (!list) return;
+    if (_sessions.length === 0) {
+      list.innerHTML = '<div class="session-empty">No saved sessions yet. Send a message to start one.</div>';
+      return;
+    }
+    list.innerHTML = '';
+    for (const s of _sessions) {
+      const item = document.createElement('div');
+      item.className = 'session-item' + (s.is_current ? ' current' : '');
+      const lastMsg = s.last_message || {};
+      const lastPreview = lastMsg.content
+        ? String(lastMsg.content).replace(/\s+/g, ' ').trim().slice(0, 80) + (String(lastMsg.content).length > 80 ? '…' : '')
+        : '(empty)';
+      const ts = s.updated_at || s.created_at || 0;
+      const dateStr = ts ? new Date(ts * 1000).toLocaleString() : 'unknown';
+      const roleLabel = lastMsg.role === 'user' ? 'You' : lastMsg.role === 'assistant' ? 'Hermes' : '';
+      item.innerHTML = `
+        <div class="session-item-name">
+          <span>${s.name || s.id}</span>
+          <span class="small">${s.message_count} msgs</span>
+        </div>
+        <div class="session-item-meta">${dateStr}</div>
+        <div class="session-item-preview">${roleLabel ? roleLabel + ': ' : ''}${lastPreview}</div>
+        <div class="session-item-actions">
+          <button class="button secondary session-switch-btn" data-sid="${s.id}" type="button">Switch</button>
+          <button class="button secondary session-rename-btn" data-sid="${s.id}" type="button">Rename</button>
+          <button class="button secondary session-delete-btn" data-sid="${s.id}" type="button" style="color:#f85149;">Delete</button>
+        </div>`;
+      // Switch click on the item itself
+      item.querySelector('.session-switch-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        switchSession(s.id);
+      });
+      // Rename
+      item.querySelector('.session-rename-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        const nameSpan = item.querySelector('.session-item-name span');
+        const currentName = s.name || s.id;
+        const input = document.createElement('input');
+        input.className = 'session-rename-input';
+        input.type = 'text';
+        input.value = currentName;
+        input.autofocus = true;
+        nameSpan.replaceWith(input);
+        input.focus();
+        input.select();
+        const finishRename = () => {
+          const newName = input.value.trim() || currentName;
+          renameSession(s.id, newName);
+        };
+        input.addEventListener('keydown', (ev) => {
+          if (ev.key === 'Enter') { input.blur(); }
+          if (ev.key === 'Escape') { input.value = currentName; input.blur(); }
+        });
+        input.addEventListener('blur', finishRename);
+      });
+      // Delete
+      item.querySelector('.session-delete-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        deleteSession(s.id);
+      });
+      list.appendChild(item);
+    }
+  }
+
+  function openSessionPanel() {
+    const overlay = document.getElementById('chatSessionOverlay');
+    const panel = document.getElementById('chatSessionPanel');
+    if (overlay) overlay.classList.add('open');
+    if (panel) panel.classList.add('open');
+    loadSessionsFromServer().then(() => renderSessionPanel());
+  }
+
+  function closeSessionPanel() {
+    const overlay = document.getElementById('chatSessionOverlay');
+    const panel = document.getElementById('chatSessionPanel');
+    if (overlay) overlay.classList.remove('open');
+    if (panel) panel.classList.remove('open');
+  }
+
+  function toggleExportMenu(e) {
+    e.stopPropagation();
+    const menu = document.getElementById('chatExportMenu');
+    if (menu) menu.classList.toggle('open');
+  }
+
+  function closeExportMenu() {
+    const menu = document.getElementById('chatExportMenu');
+    if (menu) menu.classList.remove('open');
+  }
+
+  return {
+    mount(mountPoint) {
+      const tpl = document.getElementById('tpl-chat-composer');
+      if (!tpl) return;
+      const clone = tpl.content.cloneNode(true);
+      mountPoint.appendChild(clone);
+      root = mountPoint.firstElementChild;
+      // Bind events within this component's root
+      q('.chat-send-btn').addEventListener('click', () => {
+        const input = q('.chat-input');
+        const msg = input.value.trim();
+        if (msg) { input.value = ''; chat.send(msg); }
+      });
+      q('.chat-input').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          const input = q('.chat-input');
+          const msg = input.value.trim();
+          if (msg) { input.value = ''; chat.send(msg); }
+        }
+      });
+      q('.chat-clear-btn').addEventListener('click', () => chat.clear());
+      // Session panel
+      q('.chat-sessions-btn').addEventListener('click', () => openSessionPanel());
+      q('.chat-session-name').addEventListener('click', () => openSessionPanel());
+      // Export
+      q('.chat-export-btn').addEventListener('click', (e) => toggleExportMenu(e));
+      qAll('.chat-export-option').forEach(el => {
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          closeExportMenu();
+          exportSession(el.dataset.format);
+        });
+      });
+      // Live log toggle
+      const header = q('.chat-live-header');
+      if (header) {
+        header.addEventListener('click', () => {
+          const live = liveLog();
+          const toggle = liveToggle();
+          if (!live) return;
+          if (live.classList.contains('collapsed')) {
+            live.classList.remove('collapsed');
+            if (toggle) toggle.textContent = 'Hide';
+          } else {
+            live.classList.add('collapsed');
+            if (toggle) toggle.textContent = 'Show';
+          }
+        });
+      }
+      // Session panel close
+      const panelClose = document.getElementById('chatSessionPanelClose');
+      if (panelClose) panelClose.addEventListener('click', closeSessionPanel);
+      const panelOverlay = document.getElementById('chatSessionOverlay');
+      if (panelOverlay) panelOverlay.addEventListener('click', closeSessionPanel);
+      history = loadFromStorage();
+      render();
+    },
+
+    unmount() {
+      if (root && root.parentNode) root.parentNode.removeChild(root);
+      root = null;
+    },
+
+    init() {
+      history = loadFromStorage();
+      currentSessionId = chatSessionId;
+      render();
+      setStatus('Ready');
+      setDetail(statusDetail());
+      updateSessionBadge();
+      // Fetch server-side history, merge new messages, re-render
+      chat._syncFromServer().catch(() => {});  // best-effort, silent failures
+      // Load sessions in background
+      loadSessionsFromServer();
+    },
+
+    async _syncFromServer() {
+      try {
+        const r = await api('/api/chat-history', {}, 'GET');
+        const d = await r.json();
+        const serverHistory = Array.isArray(d.history) ? d.history : [];
+        const existingKeys = new Set(
+          history.map(m => `${m.ts}|${hashString(String(m.content || ''))}`),
+        );
+        const toAdd = serverHistory.filter(m => {
+          const k = `${m.ts}|${hashString(String(m.content || ''))}`;
+          return !existingKeys.has(k);
+        });
+        if (toAdd.length > 0) {
+          history.push(...toAdd);
+          saveToStorage();
+          render();
+        }
+      } catch (_) {
+        // server unavailable — local storage is the source of truth
+      }
+    },
+
+    async send(message) {
+      const raw = String(message ?? '');
+      if (!raw.trim()) return null;
+      history.push({ role: 'user', content: raw, ts: Date.now() });
+      saveToStorage();
+      render();
+      setStatus('Thinking…');
+      setDetail(`Thinking…\n${statusDetail()}`);
+      bus.emit('chat:append', { role: 'user', content: raw });
+      clearLive();
+
+      const payload = {
+        board: currentBoard,
+        profile: currentProfile,
+        history: history.slice(0, -1),
+        message: raw,
+      };
+      if (currentSessionId) payload.session_id = currentSessionId;
+      try {
+        const r = await api('/api/chat', {}, 'POST', payload);
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Chat failed');
+        const reply = d.reply || '';
+        history.push({ role: 'assistant', content: reply, ts: Date.now() });
+        saveToStorage();
+        render();
+        setStatus(`${currentProfile} · ${currentBoard}`);
+        setDetail(statusDetail());
+        // Populate agent log with raw CLI output
+        if (d.raw) {
+          const live = liveLog();
+          if (live) {
+            live.innerHTML = '';
+            for (const line of String(d.raw).split('\n')) {
+              const cls = line.toLowerCase().includes('error') ? 'err'
+                        : line.toLowerCase().includes('success') || line.includes('✓') ? 'ok'
+                        : line.startsWith('🤖') || line.includes('Model:') || line.includes('initialized') ? 'info'
+                        : '';
+              appendLiveLine(line, cls);
+            }
+          }
+        }
+        if (d.chat_session_id) {
+          chatSessionId = d.chat_session_id;
+          currentSessionId = d.chat_session_id;
+        }
+        updateSessionBadge();
+        // Refresh session list in background
+        loadSessionsFromServer();
+        bus.emit('chat:append', { role: 'assistant', content: reply });
+        return d;
+      } catch (err) {
+        history.push({ role: 'system', content: String(err && err.message ? err.message : err) });
+        saveToStorage();
+        render();
+        setStatus('Error');
+        setDetail(`Error\n${statusDetail()}`);
+        bus.emit('chat:error', { error: err });
+        throw err;
+      }
+    },
+
+    clear() {
+      // Create a new session rather than destroying data
+      history = [];
+      saveToStorage();
+      render();
+      currentSessionId = null;
+      chatSessionId = null;
+      setStatus('Ready');
+      setDetail(statusDetail());
+      clearLive();
+      updateSessionBadge();
+      bus.emit('chat:clear', {});
+      // Reload sessions list
+      loadSessionsFromServer();
+    },
+
+    getHistory() { return history.slice(); },
+    getSessionId() { return currentSessionId; },
+    getStorageKey() { return storageKey(); },
+    statusDetail,
+    setStatus,
+    setDetail,
+    render,
+  };
+})();
+window.chat = chat;
+// ============================================================================
+// Task Module — mounts from template, owns its DOM via this.root
+// ============================================================================
+const task = (() => {
+  let root = null;
+  let taskProfile = OVERSEER_PROFILE;
+  let taskPendingProfile = OVERSEER_PROFILE;
+
+  function q(sel) { return root ? root.querySelector(sel) : null; }
+
+  function setStatus(text) {
+    const el = q('.task-status');
+    if (el) el.textContent = text;
+  }
+
+  function setDetail(text) {
+    const el = q('.task-detail');
+    if (el) el.textContent = text;
+  }
+
+  function taskStatusDetail() {
+    const selCtx = selectedTaskContext();
+    return [
+      `board=${currentBoard}`,
+      `profile=${taskProfile}${taskPendingProfile !== taskProfile ? ` (staged=${taskPendingProfile})` : ''}`,
+      `selected=${selCtx ? selCtx.id : 'none'}`,
+    ].join(' | ');
+  }
+
+  function stageTaskProfile(nextProfile) {
+    if (!nextProfile) return;
+    taskPendingProfile = nextProfile;
+    const btn = q('.task-profile-confirm-btn');
+    const state = q('.task-profile-state');
+    if (btn) btn.textContent = taskPendingProfile === taskProfile ? 'Profile active' : `Confirm ${taskPendingProfile}`;
+    if (state) state.textContent = taskPendingProfile === taskProfile ? `Active: ${taskProfile}` : `Staged: ${taskPendingProfile}`;
+    setDetail(taskStatusDetail());
+  }
+
+  function applyTaskProfile() {
+    if (!taskPendingProfile || taskPendingProfile === taskProfile) return;
+    taskProfile = taskPendingProfile;
+    const btn = q('.task-profile-confirm-btn');
+    const state = q('.task-profile-state');
+    if (state) state.textContent = `Active: ${taskProfile}`;
+    if (btn) btn.textContent = 'Profile active';
+    setDetail(taskStatusDetail());
+  }
+
+  function selectedTaskContext() {
+    const label = document.getElementById('detailsLabel');
+    const details = document.getElementById('details');
+    const labelText = label ? String(label.textContent || '').trim() : '';
+    if (!labelText || labelText === 'Select a task') return null;
+    const m = labelText.match(/^(t_[a-z0-9]+)\s+—\s+(.+)$/i);
+    return {
+      id: m ? m[1] : (selected || labelText),
+      title: m ? m[2].trim() : labelText,
+      raw: details ? String(details.textContent || '') : '',
+    };
+  }
+
+  return {
+    mount(mountPoint) {
+      const tpl = document.getElementById('tpl-task-composer');
+      if (!tpl) return;
+      const clone = tpl.content.cloneNode(true);
+      mountPoint.appendChild(clone);
+      root = mountPoint.firstElementChild;
+      q('.task-create-btn').addEventListener('click', () => task.createFromFields());
+      q('.task-from-selection-btn').addEventListener('click', () => task.createFromSelection());
+      q('.task-from-chat-btn').addEventListener('click', () => task.createWithChatSession());
+      const taskProfSel = q('.task-profile-select');
+      if (taskProfSel) {
+        taskProfSel.addEventListener('change', (e) => stageTaskProfile(e.target.value));
+        if (taskProfSel.options.length > 0) taskProfSel.value = taskProfile;
+      }
+      const taskConfBtn = q('.task-profile-confirm-btn');
+      if (taskConfBtn) taskConfBtn.addEventListener('click', () => applyTaskProfile());
+      setDetail(taskStatusDetail());
+    },
+
+    unmount() {
+      if (root && root.parentNode) root.parentNode.removeChild(root);
+      root = null;
+    },
+
+    async create({ title, body, chatSessionId, parentTask }) {
+      const t = String(title || '').trim();
+      if (!t) { setStatus('Title required'); setDetail(taskStatusDetail()); return null; }
+      const createBtn = q('.task-create-btn');
+      const prevBtnText = createBtn ? createBtn.textContent : '';
+      setStatus('Creating…');
+      if (createBtn) {
+        createBtn.disabled = true;
+        createBtn.textContent = 'Creating…';
+      }
+      const payload = {
+        board: currentBoard,
+        profile: taskProfile || OVERSEER_PROFILE,
+        assignee: taskProfile || OVERSEER_PROFILE,
+        title: t,
+        body: String(body || '').trim(),
+      };
+      if (chatSessionId) payload.chat_session_id = chatSessionId;
+      if (parentTask) payload.parent_task_id = parentTask;
+      try {
+        const r = await api('/api/create-task', {}, 'POST', payload);
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Task creation failed');
+        setStatus(`Created ${d.task?.id || 'task'}`);
+        if (createBtn) createBtn.textContent = 'Created';
+        setDetail(taskStatusDetail());
+        bus.emit('task:created', { task: d.task });
+        return d.task;
+      } catch (err) {
+        setStatus('Error');
+        if (createBtn) createBtn.textContent = 'Error';
+        setDetail(taskStatusDetail());
+        bus.emit('task:error', { error: err });
+        throw err;
+      } finally {
+        setTimeout(() => {
+          if (createBtn) {
+            createBtn.disabled = false;
+            createBtn.textContent = prevBtnText || 'Create task';
+          }
+          if (q('.task-status') && q('.task-status').textContent !== 'Ready') setStatus('Ready');
+        }, 1200);
+      }
+    },
+
+    async createFromFields() {
+      const titleEl = q('.task-title-input');
+      const bodyEl = q('.task-body-input');
+      const title = titleEl ? titleEl.value.trim() : '';
+      const body = bodyEl ? bodyEl.value.trim() : '';
+      const result = await this.create({ title, body });
+      if (result && titleEl) titleEl.value = '';
+      if (result && bodyEl) bodyEl.value = '';
+      return result;
+    },
+
+    async createFromSelection() {
+      const sel = selectedTaskContext();
+      if (!sel) { setStatus('Select a task first'); setDetail(taskStatusDetail()); return null; }
+      const titleEl = q('.task-title-input');
+      const bodyEl = q('.task-body-input');
+      const title = titleEl && titleEl.value.trim() ? titleEl.value.trim() : sel.title;
+      const body = bodyEl && bodyEl.value.trim()
+        ? bodyEl.value.trim()
+        : `Follow-up to ${sel.id}\n\n${sel.raw}`.trim();
+      return this.create({ title, body, parentTask: sel.id });
+    },
+
+    async createWithChatSession() {
+      const titleEl = q('.task-title-input');
+      const bodyEl = q('.task-body-input');
+      const title = titleEl ? titleEl.value.trim() : '';
+      const body = bodyEl ? bodyEl.value.trim() : '';
+      const sid = chat.getSessionId();
+      if (!title) { setStatus('Add a title first'); setDetail(taskStatusDetail()); return null; }
+      return this.create({ title, body, chatSessionId: sid });
+    },
+    statusDetail: taskStatusDetail,
+    setStatus,
+    setDetail,
+  };
+})();
+window.task = task;
+// ============================================================================
+// Board / Profile / Task list — shared infrastructure
+// ============================================================================
+async function loadBoards() {
+  const r = await api('/api/boards');
+  const d = await r.json();
+  const boards = Array.isArray(d.boards) ? d.boards : [];
+  const sel = document.getElementById('boardSelect');
+  sel.innerHTML = '';
+  for (const b of boards) {
+    const opt = document.createElement('option');
+    opt.value = b.slug;
+    opt.textContent = `${b.name || b.slug}${b.archived ? ' (archived)' : ''}`;
+    sel.appendChild(opt);
+  }
+  if (!currentBoard || !boards.some(b => b.slug === currentBoard)) {
+    currentBoard = (d.current_board && d.current_board.slug) || (boards[0] && boards[0].slug) || 'mobile-web-dashboard-chat';
+  }
+  sel.value = currentBoard;
+}
+
+async function loadProfiles() {
+  const r = await api('/api/profiles');
+  const d = await r.json();
+  const profiles = Array.isArray(d.profiles) ? d.profiles : [];
+  const sel = document.getElementById('profileSelect');
+  sel.innerHTML = '';
+  const taskSels = document.querySelectorAll('.task-profile-select');
+  taskSels.forEach(taskSel => { taskSel.innerHTML = ''; });
+  for (const p of profiles) {
+    const opt = document.createElement('option');
+    opt.value = p.name;
+    opt.textContent = `${p.name} — ${p.model || 'unknown model'}`;
+    sel.appendChild(opt);
+    taskSels.forEach(taskSel => {
+      const taskOpt = document.createElement('option');
+      taskOpt.value = p.name;
+      taskOpt.textContent = `${p.name} — ${p.model || 'unknown model'}`;
+      taskSel.appendChild(taskOpt);
+    });
+  }
+  if (!currentProfile || !profiles.some(p => p.name === currentProfile)) {
+    currentProfile = profiles.some(p => p.name === OVERSEER_PROFILE)
+      ? OVERSEER_PROFILE
+      : ((d.current_profile && d.current_profile.name) || (profiles[0] && profiles[0].name) || OVERSEER_PROFILE);
+  }
+  pendingProfile = currentProfile;
+  sel.value = pendingProfile;
+  taskSels.forEach(taskSel => {
+    if (Array.from(taskSel.options).some(o => o.value === OVERSEER_PROFILE)) taskSel.value = OVERSEER_PROFILE;
+  });
+  const state = document.getElementById('profileState');
+  if (state) state.textContent = `Active: ${currentProfile}`;
+  const confirmBtn = document.getElementById('profileConfirmBtn');
+  if (confirmBtn) confirmBtn.textContent = currentProfile === pendingProfile ? 'Profile active' : `Confirm ${pendingProfile}`;
+}
+
+async function refresh() {
+  const r = await api('/api/list');
+  const d = await r.json();
+  document.getElementById('summary').textContent = d.summary || '';
+  document.getElementById('boardName').textContent = d.board || currentBoard;
+  allTasks = d.tasks || [];
+  applyFilters();
+  if (selected) loadTask(selected, true);
+}
+
+// ============================================================================
+// DOM patching helpers for SSE events — avoid full re-render
+// ============================================================================
+
+function patchTask(taskId, updatedTask) {
+  // Find existing row by data-task-id
+  const row = document.querySelector(`#tasks tr[data-task-id="${taskId}"]`);
+  if (!row) {
+    // Task not in current view — fall back to full refresh
+    refresh();
+    return;
+  }
+  
+  // Update status cell class and badge
+  const statusCell = row.querySelector('td:first-child');
+  const statusBadge = row.querySelector('.status-badge');
+  const newStatus = updatedTask.status || 'todo';
+  const newState = updatedTask.state || '';
+  
+  if (statusCell) {
+    statusCell.className = `status-${newStatus}`;
+  }
+  if (statusBadge) {
+    statusBadge.textContent = `${newState} ${newStatus}`;
+  }
+  
+  // Update dataset for filter/sort consistency
+  row.dataset.status = newStatus;
+  row.dataset.title = updatedTask.title || '';
+  
+  // Update assignee cell (2nd td) and title cell (4th td)
+  const cells = row.querySelectorAll('td');
+  if (cells.length >= 4) {
+    cells[1].textContent = updatedTask.id || taskId;
+    cells[2].textContent = updatedTask.assignee || '';
+    cells[3].textContent = updatedTask.title || '';
+  }
+  
+  // If task is selected, reload its detail panel
+  if (selected === taskId) {
+    loadTask(taskId, true);
+  }
+}
+
+function patchBoardSummary(summary, boardName) {
+  const summaryEl = document.getElementById('summary');
+  const boardNameEl = document.getElementById('boardName');
+  if (summaryEl) summaryEl.textContent = summary || '';
+  if (boardNameEl) boardNameEl.textContent = boardName || currentBoard;
+}
+
+async function refreshTaskList() {
+  // Full refresh of task list only — used when patching isn't possible
+  const r = await api('/api/list');
+  const d = await r.json();
+  allTasks = d.tasks || [];
+  applyFilters();
+  if (selected) loadTask(selected, true);
+}
+
+function applyFilters() {
+  // Compute status counts from all tasks
+  const counts = { all: allTasks.length };
+  for (const t of allTasks) {
+    const s = t.status || 'todo';
+    counts[s] = (counts[s] || 0) + 1;
+  }
+
+  // Update count badges
+  const statuses = ['all', 'ready', 'running', 'done', 'blocked', 'todo'];
+  for (const s of statuses) {
+    const el = document.getElementById('count-' + s);
+    if (el) el.textContent = counts[s] || 0;
+  }
+
+  // Sync filter UI state from globals
+  document.querySelectorAll('.filter-chip').forEach(chip => {
+    chip.classList.toggle('active', chip.dataset.status === filterStatus);
+  });
+  const searchInput = document.getElementById('searchInput');
+  if (searchInput) searchInput.value = filterQuery;
+  const sortSelect = document.getElementById('sortSelect');
+  if (sortSelect) sortSelect.value = sortBy;
+  const sortToggle = document.getElementById('sortDirToggle');
+  if (sortToggle) sortToggle.textContent = sortAsc ? '▼' : '▲';
+  if (sortToggle) sortToggle.classList.toggle('active', sortAsc);
+
+  // Filter and sort the tasks
+  let filtered = allTasks;
+  if (filterStatus && filterStatus !== 'all') {
+    filtered = filtered.filter(t => (t.status || 'todo') === filterStatus);
+  }
+  if (filterQuery) {
+    const q = filterQuery.toLowerCase();
+    filtered = filtered.filter(t =>
+      (t.title || '').toLowerCase().includes(q) ||
+      (t.id || '').toLowerCase().includes(q)
+    );
+  }
+
+  // Sort
+  const dir = sortAsc ? 1 : -1;
+  filtered.sort((a, b) => {
+    let cmp = 0;
+    if (sortBy === 'title') {
+      cmp = (a.title || '').localeCompare(b.title || '');
+    } else if (sortBy === 'status') {
+      cmp = (a.status || '').localeCompare(b.status || '');
+    } else {
+      // Default: sort by created date (newest first by default)
+      const da = a.created_at || a.id || '';
+      const db = b.created_at || b.id || '';
+      cmp = da < db ? -1 : da > db ? 1 : 0;
+    }
+    return cmp * dir;
+  });
+
+  // Render
+  const tbody = document.getElementById('tasks');
+  tbody.innerHTML = '';
+  for (const t of filtered) {
+    const tr = document.createElement('tr');
+    tr.dataset.taskId = t.id;
+    tr.dataset.status = t.status;
+    tr.dataset.title = t.title;
+    tr.innerHTML = `<td class="status-${t.status}"><span class="status-badge">${t.state} ${t.status}</span></td><td>${t.id}</td><td>${t.assignee}</td><td>${t.title}</td>`;
+    tr.draggable = true;
+    tr.addEventListener('dragstart', (e) => {
+      e.dataTransfer.setData('text/plain', t.id);
+      e.dataTransfer.effectAllowed = 'move';
+      tr.classList.add('dragging');
+    });
+    tr.addEventListener('dragend', () => {
+      tr.classList.remove('dragging');
+      for (const row of tbody.querySelectorAll('tr')) row.classList.remove('drag-over');
+    });
+    tr.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      for (const row of tbody.querySelectorAll('tr')) row.classList.remove('drag-over');
+      tr.classList.add('drag-over');
+    });
+    tr.addEventListener('dragleave', () => {
+      tr.classList.remove('drag-over');
+    });
+    tr.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      const draggedId = e.dataTransfer.getData('text/plain');
+      const targetId = tr.dataset.taskId;
+      if (draggedId === targetId) return;
+      const rows = Array.from(tbody.querySelectorAll('tr'));
+      const ids = rows.map(r => r.dataset.taskId);
+      const fromIdx = ids.indexOf(draggedId);
+      const toIdx = ids.indexOf(targetId);
+      if (fromIdx < 0 || toIdx < 0) return;
+      ids.splice(fromIdx, 1);
+      ids.splice(toIdx, 0, draggedId);
+      // Optimistic DOM reorder
+      const draggedRow = rows[fromIdx];
+      if (fromIdx < toIdx) {
+        rows[toIdx].after(draggedRow);
+      } else {
+        rows[toIdx].before(draggedRow);
+      }
+      for (const row of tbody.querySelectorAll('tr')) row.classList.remove('drag-over');
+      // Persist
+      await api('/api/reorder', {}, 'POST', { board: currentBoard, order: ids });
+    });
+    tr.onclick = (e) => {
+      if (e.target.closest('.status-dropdown')) return;
+      loadTask(t.id);
+    };
+    tr.oncontextmenu = (e) => { showContextMenu(e, t.id, t.status, t.title); };
+    // Long-press for mobile touch devices
+    let longPressTimer = null;
+    const LONG_PRESS_MS = 500;
+    tr.addEventListener('touchstart', (e) => {
+      if (e.target.closest('.status-dropdown')) return;
+      longPressTimer = setTimeout(() => {
+        longPressTimer = null;
+        const touch = e.touches[0];
+        showContextMenu({ clientX: touch.clientX, clientY: touch.clientY, preventDefault: () => {} }, t.id, t.status, t.title);
+      }, LONG_PRESS_MS);
+    }, { passive: true });
+    tr.addEventListener('touchend', () => {
+      if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+    }, { passive: true });
+    tr.addEventListener('touchmove', () => {
+      if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+    }, { passive: true });
+    // Status dropdown on badge
+    const badge = tr.querySelector('.status-badge');
+    if (badge) {
+      badge.style.cursor = 'pointer';
+      badge.onclick = (e) => { e.stopPropagation(); showStatusDropdown(e, t.id, t.status, tr); };
+    }
+    tbody.appendChild(tr);
+  }
+
+  // Update summary with filtered count
+  const summaryEl = document.getElementById('summary');
+  if (summaryEl) {
+    const total = allTasks.length;
+    const shown = filtered.length;
+    const base = summaryEl.textContent.replace(/\s+\(\d+\/\d+ shown\)$/, '');
+    summaryEl.textContent = total > shown ? `${base} (${shown}/${total} shown)` : base;
+  }
+  renderBoardView(filtered);
+}
+
+function isMobile() { return window.innerWidth <= 768; }
+
+function openDetailSheet(id, title, raw) {
+  document.getElementById('detailSheetTitle').textContent = `${id} — ${title}`;
+  document.getElementById('detailSheetBody').textContent = raw;
+  document.getElementById('detailOverlay').classList.add('open');
+  document.getElementById('detailSheet').classList.add('open');
+  document.body.style.overflow = 'hidden';
+  const actions = document.getElementById('detailActions');
+  if (actions) actions.style.display = '';
+  stopEditing();
+}
+
+function closeDetailSheet() {
+  document.getElementById('detailOverlay').classList.remove('open');
+  document.getElementById('detailSheet').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+const detailCloseBtn = document.getElementById('detailSheetClose');
+if (detailCloseBtn) detailCloseBtn.addEventListener('click', closeDetailSheet);
+const detailOverlay = document.getElementById('detailOverlay');
+if (detailOverlay) detailOverlay.addEventListener('click', closeDetailSheet);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDetailSheet(); });
+async function loadTask(id, silent=false) {
+  selected = id;
+  const r = await api('/api/show/' + encodeURIComponent(id));
+  const d = await r.json();
+  // Show detail actions
+  stopEditing();
+  const actions = document.getElementById('detailActions');
+  if (actions) actions.style.display = '';
+  if (isMobile()) {
+    openDetailSheet(d.id, d.title, d.raw);
+  } else {
+    document.getElementById('detailsLabel').textContent = `${d.id} — ${d.title}`;
+    document.getElementById('details').textContent = d.raw;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Task lifecycle helpers
+// ---------------------------------------------------------------------------
+const ALL_STATUSES = ['todo','ready','running','done','blocked','scheduled','review','triage','archived'];
+let editingTaskId = null;
+let editingOriginal = { title: '', body: '' };
+
+async function patchTask(id, fields) {
+  const r = await api('/api/tasks/' + encodeURIComponent(id), {}, 'PATCH', { ...fields, board: currentBoard });
+  return r;
+}
+async function deleteTask(id) {
+  const r = await api('/api/tasks/' + encodeURIComponent(id), { board: currentBoard }, 'DELETE');
+  return r;
+}
+async function transitionTask(id, status, reason) {
+  const r = await api('/api/tasks/' + encodeURIComponent(id) + '/transition', { board: currentBoard }, 'POST', { status, reason });
+  return r;
+}
+
+function showContextMenu(e, id, status, title) {
+  e.preventDefault();
+  closeAllMenus();
+  const menu = document.getElementById('contextMenu');
+  menu.style.left = e.clientX + 'px';
+  menu.style.top = e.clientY + 'px';
+  menu.classList.add('open');
+  menu.dataset.taskId = id;
+  menu.dataset.status = status;
+  menu.dataset.title = title;
+}
+function hideContextMenu() {
+  document.getElementById('contextMenu').classList.remove('open');
+}
+
+function showStatusDropdown(e, id, currentStatus, tr) {
+  e.preventDefault();
+  e.stopPropagation();
+  closeAllMenus();
+  // Remove any existing inline dropdown
+  const existing = tr.querySelector('.status-dropdown');
+  if (existing) existing.remove();
+  const wrap = document.createElement('span');
+  wrap.className = 'status-dropdown open';
+  wrap.style.position = 'absolute';
+  wrap.style.zIndex = '60';
+  const menu = document.createElement('div');
+  menu.className = 'status-dropdown-menu';
+  menu.style.display = 'block';
+  for (const s of ALL_STATUSES) {
+    const item = document.createElement('div');
+    item.className = 'status-dropdown-item' + (s === currentStatus ? ' active' : '');
+    item.textContent = s;
+    item.onclick = async (ev) => {
+      ev.stopPropagation();
+      const r = await transitionTask(id, s);
+      if (r.ok) { refresh(); } else { const d = await r.json(); alert('Transition failed: ' + (d.error || 'unknown')); }
+      wrap.remove();
+    };
+    menu.appendChild(item);
+  }
+  wrap.appendChild(menu);
+  const badge = tr.querySelector('.status-badge');
+  if (badge) {
+    badge.style.position = 'relative';
+    badge.appendChild(wrap);
+  }
+}
+
+function closeAllMenus() {
+  hideContextMenu();
+  // Remove dynamically created inline status dropdowns (inside table rows)
+  document.querySelectorAll('tr .status-dropdown.open').forEach(el => el.remove());
+  // Close permanent dropdowns by removing the open class
+  document.querySelectorAll('#detailStatusDropdown.open').forEach(el => el.classList.remove('open'));
+  document.querySelectorAll('.status-dropdown-menu').forEach(el => { if (el.style.display === 'block') el.style.display = 'none'; });
+}
+
+// ============================================================================
+// Kanban Board View — columns, drag-and-drop, view toggle
+// ============================================================================
+let currentView = localStorage.getItem('kanbanView') || 'table';
+
+function statusLabel(status) {
+  const labels = { todo: 'To Do', ready: 'Ready', running: 'Running', done: 'Done', blocked: 'Blocked' };
+  return labels[status] || status;
+}
+
+function getStatusForColumn(colStatus) {
+  // Map column status to task status (identical for our columns)
+  return colStatus;
+}
+
+function renderBoardView(tasks) {
+  // Clear all columns
+  const columns = ['todo', 'ready', 'running', 'done', 'blocked'];
+  for (const col of columns) {
+    const body = document.getElementById('col-' + col);
+    if (!body) continue;
+    body.innerHTML = '';
+    const filtered = tasks.filter(t => t.status === col);
+    for (const t of filtered) {
+      const card = createKanbanCard(t);
+      body.appendChild(card);
+    }
+    // Update column count
+    const countEl = document.getElementById('count-' + col + '-board');
+    if (countEl) countEl.textContent = filtered.length;
+  }
+}
+
+function createKanbanCard(t) {
+  const card = document.createElement('div');
+  card.className = 'kanban-card';
+  card.draggable = true;
+  card.dataset.taskId = t.id;
+  card.dataset.status = t.status;
+  card.dataset.title = t.title;
+
+  // Title
+  const title = document.createElement('div');
+  title.className = 'card-title';
+  title.textContent = t.title || '(untitled)';
+  card.appendChild(title);
+
+  // Preview (truncated body)
+  const preview = document.createElement('div');
+  preview.className = 'card-preview';
+  // Use the raw body if available, otherwise just show nothing
+  preview.textContent = t.body ? t.body.replace(/\s+/g, ' ').trim().slice(0, 100) : '';
+  if (preview.textContent) card.appendChild(preview);
+
+  // Meta row
+  const meta = document.createElement('div');
+  meta.className = 'card-meta';
+
+  const idSpan = document.createElement('span');
+  idSpan.className = 'card-id';
+  idSpan.textContent = t.id;
+  meta.appendChild(idSpan);
+
+  if (t.assignee) {
+    const assignee = document.createElement('span');
+    assignee.className = 'card-assignee';
+    assignee.textContent = t.assignee;
+    meta.appendChild(assignee);
+  }
+
+  const badge = document.createElement('span');
+  badge.className = 'card-status-badge ' + t.status;
+  badge.textContent = t.status;
+  meta.appendChild(badge);
+
+  card.appendChild(meta);
+
+  // Click to show details (skip if just dragged)
+  card.addEventListener('click', (e) => {
+    if (!card.classList.contains('dragging') && !card.dataset.wasDragged) loadTask(t.id);
+    card.dataset.wasDragged = '';
+  });
+
+  // Context menu (right-click / long-press)
+  card.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    showContextMenu(e, t.id, t.status, t.title);
+  });
+
+  // --- HTML5 Drag and Drop (desktop) ---
+  card.addEventListener('dragstart', (e) => {
+    e.dataTransfer.setData('text/plain', t.id);
+    e.dataTransfer.effectAllowed = 'move';
+    card.classList.add('dragging');
+    // Custom drag image
+    const ghost = card.cloneNode(true);
+    ghost.className = 'kanban-drag-ghost';
+    ghost.style.left = '-9999px';
+    document.body.appendChild(ghost);
+    e.dataTransfer.setDragImage(ghost, 20, 20);
+    setTimeout(() => document.body.removeChild(ghost), 0);
+    // Store drag source info
+    dragSource = { id: t.id, status: t.status, el: card };
+  });
+
+  card.addEventListener('dragend', () => {
+    card.classList.remove('dragging');
+    card.dataset.wasDragged = '1';
+    document.querySelectorAll('.kanban-column-body.drag-over').forEach(el => el.classList.remove('drag-over'));
+    dragSource = null;
+  });
+
+  // --- Touch drag (mobile) ---
+  let touchState = null;
+  const LONG_PRESS_MS = 300;
+
+  card.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) return;
+    const touch = e.touches[0];
+    touchState = {
+      startX: touch.clientX,
+      startY: touch.clientY,
+      moved: false,
+      timer: setTimeout(() => {
+        // Long press initiates drag
+        if (!touchState) return;
+        touchState.active = true;
+        card.classList.add('dragging');
+        dragSource = { id: t.id, status: t.status, el: card };
+        // Create a visual clone that follows the finger
+        const clone = card.cloneNode(true);
+        clone.className = 'kanban-drag-ghost';
+        clone.style.left = (touch.clientX - 20) + 'px';
+        clone.style.top = (touch.clientY - 20) + 'px';
+        clone.id = 'touchDragGhost';
+        document.body.appendChild(clone);
+      }, LONG_PRESS_MS),
+    };
+  }, { passive: true });
+
+  card.addEventListener('touchmove', (e) => {
+    if (!touchState) return;
+    const touch = e.touches[0];
+    const dx = Math.abs(touch.clientX - touchState.startX);
+    const dy = Math.abs(touch.clientY - touchState.startY);
+    if (dx > 10 || dy > 10) {
+      touchState.moved = true;
+      if (touchState.timer) {
+        clearTimeout(touchState.timer);
+        touchState.timer = null;
+      }
+    }
+    if (touchState.active) {
+      e.preventDefault();
+      // Move ghost
+      const ghost = document.getElementById('touchDragGhost');
+      if (ghost) {
+        ghost.style.left = (touch.clientX - 20) + 'px';
+        ghost.style.top = (touch.clientY - 20) + 'px';
+      }
+      // Highlight drop target
+      document.querySelectorAll('.kanban-column-body').forEach(body => {
+        const rect = body.getBoundingClientRect();
+        if (touch.clientX >= rect.left && touch.clientX <= rect.right &&
+            touch.clientY >= rect.top && touch.clientY <= rect.bottom) {
+          body.classList.add('drag-over');
+        } else {
+          body.classList.remove('drag-over');
+        }
+      });
+    }
+  }, { passive: false });
+
+  card.addEventListener('touchend', async (e) => {
+    if (!touchState) return;
+    if (touchState.timer) {
+      clearTimeout(touchState.timer);
+    }
+    if (touchState.active && dragSource) {
+      // Find which column we dropped on
+      const touch = e.changedTouches[0];
+      let targetCol = null;
+      document.querySelectorAll('.kanban-column-body').forEach(body => {
+        const rect = body.getBoundingClientRect();
+        if (touch.clientX >= rect.left && touch.clientX <= rect.right &&
+            touch.clientY >= rect.top && touch.clientY <= rect.bottom) {
+          targetCol = body;
+        }
+      });
+      // Remove ghost
+      const ghost = document.getElementById('touchDragGhost');
+      if (ghost) ghost.remove();
+      card.classList.remove('dragging');
+      document.querySelectorAll('.kanban-column-body.drag-over').forEach(el => el.classList.remove('drag-over'));
+      if (targetCol) {
+        const col = targetCol.closest('.kanban-column');
+        if (col) {
+          const targetStatus = col.dataset.status;
+          if (targetStatus !== dragSource.status) {
+            card.dataset.wasDragged = '1';
+            const r = await transitionTask(t.id, targetStatus);
+            if (r.ok) { refresh(); }
+            else {
+              const d = await r.json();
+              console.warn('Touch drop failed:', d.error);
+            }
+          } else {
+            card.dataset.wasDragged = '1';
+          }
+        }
+      }
+    }
+    touchState = null;
+    dragSource = null;
+  }, { passive: true });
+
+  return card;
+}
+
+let dragSource = null;
+
+// Set up drop zones on columns (idempotent — only add listeners once)
+let kanbanDropZonesSetup = false;
+function setupKanbanDropZones() {
+  if (kanbanDropZonesSetup) return;
+  kanbanDropZonesSetup = true;
+  document.querySelectorAll('.kanban-column-body').forEach(body => {
+    body.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      body.classList.add('drag-over');
+    });
+
+    body.addEventListener('dragleave', () => {
+      body.classList.remove('drag-over');
+    });
+
+    body.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      body.classList.remove('drag-over');
+      const taskId = e.dataTransfer.getData('text/plain');
+      if (!taskId || !dragSource) return;
+      const col = body.closest('.kanban-column');
+      if (!col) return;
+      const targetStatus = col.dataset.status;
+      if (targetStatus === dragSource.status) return; // same column
+      const r = await transitionTask(taskId, targetStatus);
+      if (r.ok) { refresh(); }
+      else {
+        const d = await r.json();
+        console.warn('Drop transition failed:', d.error);
+      }
+      dragSource = null;
+    });
+  });
+}
+
+function toggleView(view) {
+  currentView = view;
+  localStorage.setItem('kanbanView', view);
+  const tableView = document.getElementById('tableView');
+  const boardView = document.getElementById('kanbanBoard');
+  const btns = document.querySelectorAll('#viewToggle button');
+  btns.forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.view === view);
+  });
+  if (view === 'board') {
+    tableView.classList.remove('active');
+    tableView.classList.add('hidden');
+    boardView.classList.add('active');
+  } else {
+    tableView.classList.add('active');
+    tableView.classList.remove('hidden');
+    boardView.classList.remove('active');
+  }
+}
+
+// Setup view toggle — use same pattern as existing boot code
+function initKanbanView() {
+  const viewBtns = document.querySelectorAll('#viewToggle button');
+  viewBtns.forEach(btn => {
+    btn.addEventListener('click', () => toggleView(btn.dataset.view));
+  });
+  // Initialize from stored preference
+  if (currentView === 'board') {
+    toggleView('board');
+  }
+  setupKanbanDropZones();
+}
+
+// Also re-setup drop zones when board becomes visible after refresh
+bus.on('task:created', () => { setTimeout(setupKanbanDropZones, 0); });
+
+// Defer init until DOM ready (matches pattern used by bootKanbanUI)
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initKanbanView, { once: true });
+} else {
+  initKanbanView();
+}
+
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.context-menu')) hideContextMenu();
+  if (!e.target.closest('.status-dropdown')) closeAllMenus();
+  if (!e.target.closest('.chat-export-menu') && !e.target.closest('.chat-export-btn')) {
+    const menu = document.getElementById('chatExportMenu');
+    if (menu) menu.classList.remove('open');
+  }
+});
+document.addEventListener('touchstart', (e) => {
+  if (!e.target.closest('.context-menu')) hideContextMenu();
+  if (!e.target.closest('.status-dropdown')) closeAllMenus();
+  if (!e.target.closest('.chat-export-menu') && !e.target.closest('.chat-export-btn')) {
+    const menu = document.getElementById('chatExportMenu');
+    if (menu) menu.classList.remove('open');
+  }
+}, { passive: true });
+
+const contextMenu = document.getElementById('contextMenu');
+if (contextMenu) contextMenu.addEventListener('click', async (e) => {
+  const item = e.target.closest('.context-menu-item');
+  if (!item) return;
+  const menu = document.getElementById('contextMenu');
+  const id = menu.dataset.taskId;
+  const action = item.dataset.action;
+  hideContextMenu();
+  if (!id) return;
+  if (action === 'edit') {
+    const r = await api('/api/show/' + encodeURIComponent(id));
+    const d = await r.json();
+    startEditing(id, d.title, d.raw);
+  } else if (action === 'done') {
+    const r = await transitionTask(id, 'done');
+    if (r.ok) refresh(); else { const d = await r.json(); alert('Failed: ' + (d.error || 'unknown')); }
+  } else if (action === 'blocked') {
+    const reason = prompt('Block reason (optional):');
+    if (reason === null) return;
+    const r = await transitionTask(id, 'blocked', reason);
+    if (r.ok) refresh(); else { const d = await r.json(); alert('Failed: ' + (d.error || 'unknown')); }
+  } else if (action === 'ready') {
+    const r = await transitionTask(id, 'ready');
+    if (r.ok) refresh(); else { const d = await r.json(); alert('Failed: ' + (d.error || 'unknown')); }
+  } else if (action === 'delete') {
+    if (!confirm(`Delete task ${id}? This cannot be undone.`)) return;
+    const r = await deleteTask(id);
+    if (r.ok) { selected = null; refresh(); } else { const d = await r.json(); alert('Failed: ' + (d.error || 'unknown')); }
+  }
+});
+
+// Detail sheet inline editing
+function startEditing(id, title, rawBody) {
+  editingTaskId = id;
+  editingOriginal = { title: title || '', body: rawBody || '' };
+  const titleInput = document.getElementById('detailSheetTitleInput');
+  const bodyInput = document.getElementById('detailSheetBodyInput');
+  const bodyPre = document.getElementById('detailSheetBody');
+  const actions = document.getElementById('detailActions');
+  titleInput.value = editingOriginal.title;
+  bodyInput.value = editingOriginal.body;
+  titleInput.style.display = '';
+  bodyInput.style.display = '';
+  bodyPre.style.display = 'none';
+  actions.style.display = '';
+  document.getElementById('detailEditBtn').style.display = 'none';
+  document.getElementById('detailDeleteBtn').style.display = 'none';
+  document.getElementById('detailStatusDropdown').style.display = 'none';
+  document.getElementById('detailSaveBtn').style.display = '';
+  document.getElementById('detailCancelBtn').style.display = '';
+}
+
+function stopEditing() {
+  editingTaskId = null;
+  const titleInput = document.getElementById('detailSheetTitleInput');
+  const bodyInput = document.getElementById('detailSheetBodyInput');
+  const bodyPre = document.getElementById('detailSheetBody');
+  const actions = document.getElementById('detailActions');
+  titleInput.style.display = 'none';
+  bodyInput.style.display = 'none';
+  bodyPre.style.display = '';
+  actions.style.display = '';
+  document.getElementById('detailEditBtn').style.display = '';
+  document.getElementById('detailDeleteBtn').style.display = '';
+  document.getElementById('detailStatusDropdown').style.display = '';
+  document.getElementById('detailSaveBtn').style.display = 'none';
+  document.getElementById('detailCancelBtn').style.display = 'none';
+}
+
+const detailEditBtn = document.getElementById('detailEditBtn');
+if (detailEditBtn) detailEditBtn.addEventListener('click', async () => {
+  if (!selected) return;
+  const r = await api('/api/show/' + encodeURIComponent(selected));
+  const d = await r.json();
+  startEditing(selected, d.title, d.raw);
+});
+
+const detailSaveBtn = document.getElementById('detailSaveBtn');
+if (detailSaveBtn) detailSaveBtn.addEventListener('click', async () => {
+  if (!editingTaskId) return;
+  const title = document.getElementById('detailSheetTitleInput').value.trim();
+  const body = document.getElementById('detailSheetBodyInput').value.trim();
+  const r = await patchTask(editingTaskId, { title, body });
+  if (r.ok) {
+    stopEditing();
+    refresh();
+    if (selected) loadTask(selected);
+  } else {
+    const d = await r.json(); alert('Save failed: ' + (d.error || 'unknown'));
+  }
+});
+
+const detailCancelBtn = document.getElementById('detailCancelBtn');
+if (detailCancelBtn) detailCancelBtn.addEventListener('click', () => { stopEditing(); });
+
+const detailDeleteBtn = document.getElementById('detailDeleteBtn');
+if (detailDeleteBtn) detailDeleteBtn.addEventListener('click', async () => {
+  if (!selected) return;
+  if (!confirm(`Delete task ${selected}? This cannot be undone.`)) return;
+  const r = await deleteTask(selected);
+  if (r.ok) { selected = null; closeDetailSheet(); refresh(); }
+  else { const d = await r.json(); alert('Delete failed: ' + (d.error || 'unknown')); }
+});
+
+// Detail sheet status dropdown
+const detailStatusBtn = document.getElementById('detailStatusBtn');
+const detailStatusMenu = document.getElementById('detailStatusMenu');
+if (detailStatusBtn && detailStatusMenu) {
+  ALL_STATUSES.forEach(s => {
+    const item = document.createElement('div');
+    item.className = 'status-dropdown-item';
+    item.textContent = s;
+    item.onclick = async () => {
+      if (!selected) return;
+      const r = await transitionTask(selected, s);
+      if (r.ok) { refresh(); if (selected) loadTask(selected); }
+      else { const d = await r.json(); alert('Transition failed: ' + (d.error || 'unknown')); }
+    };
+    detailStatusMenu.appendChild(item);
+  });
+  detailStatusBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const wrap = document.getElementById('detailStatusDropdown');
+    wrap.classList.toggle('open');
+  });
+}
+
+function setBoard(nextBoard) {
+  if (!nextBoard || nextBoard === currentBoard) return;
+  currentBoard = nextBoard;
+  selected = null;
+  chatSessionId = null;
+  document.getElementById('boardName').textContent = currentBoard;
+  chat.init();  // reload chat history for new board
+  syncUrl();
+  refresh();
+}
+
+function stageProfile(nextProfile) {
+  if (!nextProfile) return;
+  pendingProfile = nextProfile;
+  const confirmBtn = document.getElementById('profileConfirmBtn');
+  if (confirmBtn) confirmBtn.textContent = pendingProfile === currentProfile ? 'Profile active' : `Confirm ${pendingProfile}`;
+  const state = document.getElementById('profileState');
+  if (state) state.textContent = pendingProfile === currentProfile ? `Active: ${currentProfile}` : `Staged: ${pendingProfile} (active: ${currentProfile})`;
+  if (chat && typeof chat.setDetail === 'function') chat.setDetail(chat.statusDetail());
+  if (window.task && typeof window.task.setDetail === 'function') window.task.setDetail(window.task.statusDetail());
+  if (window.promptComposer && typeof window.promptComposer.setDetail === 'function') window.promptComposer.setDetail(window.promptComposer.statusDetail());
+}
+
+function applyProfile() {
+  if (!pendingProfile || pendingProfile === currentProfile) return;
+  currentProfile = pendingProfile;
+  syncUrl();
+  chat.setStatus(`${currentProfile} · ${currentBoard}`);
+  chat.setDetail(chat.statusDetail());
+  if (window.task && typeof window.task.setDetail === 'function') window.task.setDetail(window.task.statusDetail());
+  if (window.promptComposer && typeof window.promptComposer.setDetail === 'function') window.promptComposer.setDetail(window.promptComposer.statusDetail());
+  const state = document.getElementById('profileState');
+  if (state) state.textContent = `Active: ${currentProfile}`;
+  const confirmBtn = document.getElementById('profileConfirmBtn');
+  if (confirmBtn) confirmBtn.textContent = 'Profile active';
+  refresh();
+}
+
+// ============================================================================
+// PromptComposer — mounts from template, owns its DOM via this.root
+// ============================================================================
+const promptComposer = (() => {
+  let root = null;
+  function q(sel) { return root ? root.querySelector(sel) : null; }
+  function setStatus(text) { const el = q('.prompt-status'); if (el) el.textContent = text; }
+  function setDetail(text) { const el = q('.prompt-detail'); if (el) el.textContent = text; }
+  function promptStatusDetail() {
+    const input = q('.prompt-input');
+    const isSecret = input ? input.type === 'password' : true;
+    return [
+      `board=${currentBoard}`,
+      `profile=${currentProfile}${pendingProfile && pendingProfile !== currentProfile ? ' (staged=' + pendingProfile + ')' : ''}`,
+      `secret=${isSecret ? 'hidden' : 'visible'}`,
+    ].join(' | ');
+  }
+  async function sendResponse(message, displayContent) {
+    const input = q('.prompt-input');
+    const response = String(message !== undefined ? message : (input ? input.value : '') || '');
+    if (!response.trim()) return;
+    if (input) input.value = '';
+    try {
+      await window.chat.send(displayContent || response);
+      setStatus('Ready');
+      setDetail(promptStatusDetail());
+    } catch (_) { setStatus('Error'); setDetail(promptStatusDetail()); }
+  }
+  return {
+    mount(mountPoint) {
+      const tpl = document.getElementById('tpl-prompt-composer');
+      if (!tpl) return;
+      const clone = tpl.content.cloneNode(true);
+      mountPoint.appendChild(clone);
+      root = mountPoint.firstElementChild;
+      q('.prompt-approve-btn').addEventListener('click', () => sendResponse('y', 'Prompt response: y'));
+      q('.prompt-deny-btn').addEventListener('click', () => sendResponse('n', 'Prompt response: n'));
+      q('.prompt-enter-btn').addEventListener('click', () => sendResponse('[prompt response: enter]', 'Prompt response: Enter'));
+      q('.prompt-send-btn').addEventListener('click', () => {
+        const input = q('.prompt-input');
+        if (!input || !input.value.trim()) return;
+        const display = input.type === 'password' ? 'Prompt response: [hidden secret]' : 'Prompt response: ' + input.value;
+        sendResponse(input.value, display);
+      });
+      q('.prompt-input').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); q('.prompt-send-btn').click(); }
+      });
+      q('.prompt-secret-toggle').addEventListener('click', () => {
+        const input = q('.prompt-input');
+        const btn = q('.prompt-secret-toggle');
+        const next = input.type === 'password' ? 'text' : 'password';
+        input.type = next;
+        btn.textContent = next === 'password' ? 'Show' : 'Hide';
+        setDetail(promptStatusDetail());
+      });
+      setStatus('Ready');
+      setDetail(promptStatusDetail());
+    },
+    unmount() { if (root && root.parentNode) root.parentNode.removeChild(root); root = null; },
+    setStatus, setDetail, sendResponse,
+    statusDetail: promptStatusDetail,
+  };
+})();
+window.promptComposer = promptComposer;
+
+// ============================================================================
+// Event bindings — static elements only (board/profile selectors, detail sheet)
+// ============================================================================
+document.getElementById('boardSelect').addEventListener('change', (e) => setBoard(e.target.value));
+document.getElementById('profileSelect').addEventListener('change', (e) => stageProfile(e.target.value));
+document.getElementById('profileConfirmBtn').addEventListener('click', () => applyProfile());
+document.getElementById('refreshBtn').addEventListener('click', () => refresh());
+document.getElementById('editProfilesBtn').addEventListener('click', () => profileEditor.open());
+
+// ---- Filter / Search / Sort event bindings ----
+// Debounced search
+let searchDebounceTimer = null;
+document.getElementById('searchInput').addEventListener('input', (e) => {
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => {
+    filterQuery = e.target.value;
+    syncUrl();
+    applyFilters();
+  }, 250);
+});
+
+// Filter chips
+document.querySelectorAll('.filter-chip').forEach(chip => {
+  chip.addEventListener('click', () => {
+    const status = chip.dataset.status;
+    if (status === 'all') {
+      filterStatus = 'all';
+    } else {
+      filterStatus = filterStatus === status ? 'all' : status;
+    }
+    syncUrl();
+    applyFilters();
+  });
+});
+
+// Sort select
+document.getElementById('sortSelect').addEventListener('change', (e) => {
+  sortBy = e.target.value;
+  syncUrl();
+  applyFilters();
+});
+
+// Sort direction toggle
+document.getElementById('sortDirToggle').addEventListener('click', () => {
+  sortAsc = !sortAsc;
+  syncUrl();
+  applyFilters();
+});
+
+// Cross-module event wiring (the ONLY place modules talk to each other)
+bus.on('task:created', async ({ task: t }) => {
+  await refresh();
+  if (window.task && typeof window.task.setDetail === 'function') window.task.setDetail(window.task.statusDetail());
+});
+
+// ============================================================================
+// Init — mount template components, then load data
+// ============================================================================
+function bootKanbanUI() {
+  const chatApp = window.chat;
+  const taskApp = window.task;
+  const promptApp = window.promptComposer;
+  if (!chatApp || !taskApp || !promptApp) {
+    console.error('bootKanbanUI: app modules not ready');
+    return;
+  }
+  chatApp.mount(document.getElementById('chatComposerMount'));
+  taskApp.mount(document.getElementById('taskComposerMount'));
+  promptApp.mount(document.getElementById('promptComposerMount'));
+  if (window.profileEditor && typeof window.profileEditor.init === 'function') {
+    window.profileEditor.init();
+  }
+  loadBoards()
+    .then(() => loadProfiles())
+    .then(() => {
+      syncUrl();
+      chatApp.init();
+      return refresh();
+    })
+    .then(() => {
+      chatApp.setStatus(`${currentProfile} · ${currentBoard}`);
+      chatApp.setDetail(chatApp.statusDetail());
+      taskApp.setDetail(taskApp.statusDetail());
+      promptApp.setStatus('Ready');
+      promptApp.setDetail(promptApp.statusDetail());
+    })
+    .catch((err) => {
+      console.error('bootKanbanUI failed', err);
+    });
+}
+
+if (document.readyState === 'loading') {
+  window.addEventListener('DOMContentLoaded', bootKanbanUI, { once: true });
+} else {
+  bootKanbanUI();
+}
+
+// ============================================================================
+// SSE — real-time event stream, replaces polling
+// ============================================================================
+let eventSource = null;
+
+function connectSSE() {
+  stopPolling();  // clear any stale fallback timer
+  if (eventSource) {
+    eventSource.close();
+  }
+  const params = new URLSearchParams({ board: currentBoard, profile: currentProfile });
+  eventSource = new EventSource('/api/events?' + params.toString());
+
+  eventSource.addEventListener('connected', (e) => {
+    const data = JSON.parse(e.data);
+    console.log('SSE connected:', data.board, data.profile);
+    stopPolling();  // SSE is live — stop the fallback
+    document.querySelector('.small:last-child')?.replaceWith(
+      Object.assign(document.createElement('span'), { className: 'small', textContent: 'live via SSE' })
+    );
+  });
+
+  eventSource.addEventListener('task-changed', async (e) => {
+    const data = JSON.parse(e.data);
+    console.log('SSE task-changed:', data.action, data.task_id);
+    
+    // Fetch updated task list and find the changed task
+    try {
+      const r = await api('/api/list');
+      if (r.ok) {
+        const d = await r.json();
+        const updatedTask = (d.tasks || []).find(t => t.id === data.task_id);
+        if (updatedTask) {
+          patchTask(data.task_id, updatedTask);
+        } else {
+          // Task not found in list — full refresh
+          refreshTaskList();
+        }
+      } else {
+        refreshTaskList();
+      }
+    } catch (err) {
+      console.warn('task-changed patch failed, falling back to refresh:', err);
+      refreshTaskList();
+    }
+  });
+
+  eventSource.addEventListener('chat-message', (e) => {
+    const data = JSON.parse(e.data);
+    console.log('SSE chat-message:', data.board, data.session_id);
+    const chatApp = window.chat;
+    if (chatApp && typeof chatApp.init === 'function') {
+      chatApp.init();
+    }
+  });
+
+  eventSource.addEventListener('board-update', async (e) => {
+    console.log('SSE board-update');
+    // Fetch updated board data and patch summary/name inline
+    try {
+      const r = await api('/api/list');
+      if (r.ok) {
+        const d = await r.json();
+        patchBoardSummary(d.summary || '', d.board || currentBoard);
+        // Also refresh the task list since board changed
+        refreshTaskList();
+      } else {
+        refresh();
+      }
+    } catch (err) {
+      console.warn('board-update patch failed, falling back to refresh:', err);
+      refresh();
+    }
+  });
+
+  eventSource.addEventListener('profile-changed', (e) => {
+    console.log('SSE profile-changed');
+    loadProfiles();
+  });
+
+  eventSource.onerror = () => {
+    console.warn('SSE connection error, falling back to adaptive polling');
+    document.querySelector('.small:last-child')?.replaceWith(
+      Object.assign(document.createElement('span'), { className: 'small', textContent: 'SSE disconnected, polling...' })
+    );
+    // EventSource auto-reconnects — close old one to be safe
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+    // Start adaptive polling fallback instead of fixed reconnect
+    pollErrorStreak = 0;
+    pollTick();
+  };
+}
+
+// Kick off SSE after bootKanbanUI finishes
+const origBoot = bootKanbanUI;
+bootKanbanUI = function() {
+  origBoot.apply(this, arguments);
+  // Wait a beat for initial load, then connect SSE
+  setTimeout(connectSSE, 500);
+};
+// Also update label on reconnect after board/profile change
+const origSetBoard = setBoard;
+setBoard = function(nextBoard) {
+  origSetBoard.apply(this, arguments);
+  connectSSE();
+};
+const origApplyProfile = applyProfile;
+applyProfile = function() {
+  origApplyProfile.apply(this, arguments);
+  connectSSE();
+};
+// ============================================================================
+// Adaptive polling fallback — kicks in when SSE disconnects
+// ============================================================================
+let pollTimer = null;
+let pollErrorStreak = 0;
+const POLL_INTERVALS = [3000, 10000, 30000, 60000];
+
+function pollTick() {
+  // Pause during active chat or task creation — skip the request
+  const chatStatus = document.querySelector('.chat-status');
+  const taskStatus = document.querySelector('.task-status');
+  if ((chatStatus && chatStatus.textContent === 'Thinking…') ||
+      (taskStatus && (taskStatus.textContent === 'Creating…'))) {
+    schedulePoll();
+    return;
+  }
+  api('/api/ping')
+    .then(r => {
+      if (!r.ok) { pollErrorStreak++; schedulePoll(); return; }
+      pollErrorStreak = 0;
+      // Server is back — try reconnecting SSE for live updates
+      connectSSE();
+    })
+    .catch(() => {
+      pollErrorStreak++;
+      schedulePoll();
+    });
+}
+
+function schedulePoll() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  // Don't poll if SSE is active — it's the primary mechanism
+  if (eventSource !== null) return;
+  const idx = Math.min(pollErrorStreak, POLL_INTERVALS.length - 1);
+  pollTimer = setTimeout(pollTick, POLL_INTERVALS[idx]);
+}
+
+function stopPolling() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  pollErrorStreak = 0;
+}
+
+// ============================================================================
+const profileEditor = (() => {
+  let profilesCache = [];
+  let selectedProfile = null;
+  let isCreating = false;
+
+  const overlay = () => document.getElementById('profileEditorOverlay');
+  const modal = () => document.getElementById('profileEditorModal');
+  const sidebar = () => document.getElementById('profileEditorSidebar');
+  const msgEl = () => document.getElementById('peMsg');
+
+  let modelsCache = {};  // { provider: [model1, model2, ...] }
+
+  function setMsg(text, ok) {
+    const el = msgEl();
+    if (!el) return;
+    el.textContent = text || '';
+    el.className = 'profile-editor-msg ' + (ok ? 'ok' : (ok === false ? 'err' : ''));
+  }
+
+  function getFields() {
+    const peProviderSel = document.getElementById('peProvider');
+    const peProviderCustom = document.getElementById('peProviderCustom');
+    const peModelSel = document.getElementById('peModel');
+    const peModelCustom = document.getElementById('peModelCustom');
+    return {
+      name: document.getElementById('peName').value.trim(),
+      provider: peProviderSel && peProviderSel.value === 'custom'
+        ? (peProviderCustom ? peProviderCustom.value.trim() : '')
+        : (peProviderSel ? peProviderSel.value : ''),
+      model_default: peModelSel && peModelSel.value === 'custom'
+        ? (peModelCustom ? peModelCustom.value.trim() : '')
+        : (peModelSel ? peModelSel.value : ''),
+      base_url: document.getElementById('peBaseUrl').value.trim(),
+      context_length: document.getElementById('peContext').value.trim(),
+      api_mode: document.getElementById('peApiMode').value.trim(),
+      reasoning_effort: document.getElementById('peReasoningEffort').value,
+      show_reasoning: document.getElementById('peReasoning').value,
+      max_turns: document.getElementById('peMaxTurns').value.trim(),
+      personality: document.getElementById('pePersonality').value,
+    };
+  }
+
+  function setFields(cfg) {
+    document.getElementById('peName').value = cfg.name || '';
+    // Provider: dropdown or custom
+    const peProviderSel = document.getElementById('peProvider');
+    const peProviderCustom = document.getElementById('peProviderCustom');
+    const prov = cfg.provider || '';
+    if (peProviderCustom) peProviderCustom.style.display = 'none';
+    if (peProviderSel) {
+      const hasOption = prov && Array.from(peProviderSel.options).some(o => o.value === prov);
+      if (hasOption) {
+        peProviderSel.value = prov;
+      } else if (prov) {
+        peProviderSel.value = 'custom';
+        if (peProviderCustom) { peProviderCustom.value = prov; peProviderCustom.style.display = ''; }
+      } else {
+        peProviderSel.value = '';
+      }
+    }
+    // Model: dropdown or custom
+    const peModelSel = document.getElementById('peModel');
+    const peModelCustom = document.getElementById('peModelCustom');
+    const mdl = cfg.model_default || '';
+    if (peModelCustom) peModelCustom.style.display = 'none';
+    if (peModelSel) {
+      const hasOption = mdl && Array.from(peModelSel.options).some(o => o.value === mdl);
+      if (hasOption) {
+        peModelSel.value = mdl;
+      } else if (mdl) {
+        peModelSel.value = 'custom';
+        if (peModelCustom) { peModelCustom.value = mdl; peModelCustom.style.display = ''; }
+      } else {
+        peModelSel.value = '';
+      }
+    }
+    document.getElementById('peBaseUrl').value = cfg.base_url || '';
+    document.getElementById('peContext').value = cfg.context_length || '';
+    document.getElementById('peApiMode').value = cfg.api_mode || '';
+    document.getElementById('peReasoningEffort').value = cfg.reasoning_effort || '';
+    document.getElementById('peReasoning').value = cfg.show_reasoning || '';
+    document.getElementById('peMaxTurns').value = cfg.max_turns || '';
+    document.getElementById('pePersonality').value = cfg.personality || '';
+    // Update model dropdown based on selected provider
+    if (peProviderSel && peProviderSel.value && peProviderSel.value !== 'custom') {
+      populateModelDropdown(peProviderSel.value, mdl);
+    }
+  }
+
+  function populateModelDropdown(provider, selectedModel) {
+    const peModelSel = document.getElementById('peModel');
+    if (!peModelSel) return;
+    const models = modelsCache[provider] || [];
+    peModelSel.innerHTML = '<option value="">-- select model --</option>';
+    for (const m of models) {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      peModelSel.appendChild(opt);
+    }
+    const customOpt = document.createElement('option');
+    customOpt.value = 'custom';
+    customOpt.textContent = 'Custom...';
+    peModelSel.appendChild(customOpt);
+    // Restore selection if it exists in the new list
+    if (selectedModel && models.includes(selectedModel)) {
+      peModelSel.value = selectedModel;
+    } else if (selectedModel) {
+      peModelSel.value = 'custom';
+      const peModelCustom = document.getElementById('peModelCustom');
+      if (peModelCustom) { peModelCustom.value = selectedModel; peModelCustom.style.display = ''; }
+    }
+  }
+
+  function toggleCustomField(selectId, customId) {
+    const sel = document.getElementById(selectId);
+    const custom = document.getElementById(customId);
+    if (!sel || !custom) return;
+    custom.style.display = sel.value === 'custom' ? '' : 'none';
+  }
+
+  function renderSidebar() {
+    const sb = sidebar();
+    if (!sb) return;
+    sb.innerHTML = '';
+    for (const p of profilesCache) {
+      const div = document.createElement('div');
+      div.className = 'profile-editor-sidebar-item' + (selectedProfile === p.name ? ' active' : '');
+      div.innerHTML = `<span>${p.name}</span><span class="small">${p.model || ''}</span>`;
+      div.onclick = () => { isCreating = false; selectedProfile = p.name; renderSidebar(); loadProfile(p.name); };
+      sb.appendChild(div);
+    }
+  }
+
+  async function loadProfile(name) {
+    setMsg('Loading…', null);
+    try {
+      const r = await api('/api/profile/' + encodeURIComponent(name));
+      const d = await r.json();
+      if (d.error) { setMsg(d.error, false); return; }
+      document.getElementById('peName').readOnly = true;
+      // Ensure model catalog is loaded before setting fields (race condition fix)
+      if (Object.keys(modelsCache).length === 0) {
+        try {
+          const mr = await api('/api/models');
+          const md = await mr.json();
+          modelsCache = md.providers || {};
+          populateProviderDropdown();
+        } catch (_) {}
+      }
+      setFields(d);
+      setMsg('Loaded ' + name, true);
+    } catch (err) {
+      setMsg(String(err), false);
+    }
+  }
+
+  async function saveProfile() {
+    console.log('saveProfile entered, isCreating=', isCreating);
+    const fields = getFields();
+    if (!fields.name) { setMsg('Name is required', false); return; }
+    setMsg('Saving…', null);
+    try {
+      const r = await api('/api/profile/' + encodeURIComponent(fields.name), {}, 'POST', fields);
+      const d = await r.json();
+      if (d.error) { setMsg(d.error, false); return; }
+      setMsg('Saved ' + fields.name, true);
+      await loadProfiles();
+      // Refresh cache for sidebar
+      const pr = await api('/api/profiles');
+      const pd = await pr.json();
+      profilesCache = Array.isArray(pd.profiles) ? pd.profiles : [];
+      renderSidebar();
+    } catch (err) {
+      setMsg(String(err), false);
+    }
+  }
+
+  async function createProfile() {
+    const fields = getFields();
+    if (!fields.name) { setMsg('Enter a name for the new profile', false); return; }
+    setMsg('Creating…', null);
+    try {
+      const r = await api('/api/profile', {}, 'POST', fields);
+      const d = await r.json();
+      if (d.error) { setMsg(d.error, false); return; }
+      setMsg('Created ' + fields.name, true);
+      isCreating = false;
+      selectedProfile = fields.name;
+      document.getElementById('peName').readOnly = true;
+      await loadProfiles();
+      const pr = await api('/api/profiles');
+      const pd = await pr.json();
+      profilesCache = Array.isArray(pd.profiles) ? pd.profiles : [];
+      renderSidebar();
+    } catch (err) {
+      setMsg(String(err), false);
+    }
+  }
+
+  async function deleteProfile() {
+    const name = selectedProfile;
+    if (!name) { setMsg('Select a profile to delete', false); return; }
+    if (!confirm('Delete profile "' + name + '"? This cannot be undone.')) return;
+    setMsg('Deleting…', null);
+    try {
+      const r = await api('/api/profile/' + encodeURIComponent(name), {}, 'DELETE');
+      const d = await r.json();
+      if (d.error) { setMsg(d.error, false); return; }
+      setMsg('Deleted ' + name, true);
+      selectedProfile = null;
+      document.getElementById('peName').value = '';
+      document.getElementById('peName').readOnly = false;
+      await loadProfiles();
+      const pr = await api('/api/profiles');
+      const pd = await pr.json();
+      profilesCache = Array.isArray(pd.profiles) ? pd.profiles : [];
+      renderSidebar();
+    } catch (err) {
+      setMsg(String(err), false);
+    }
+  }
+
+  function open() {
+    selectedProfile = currentProfile;
+    isCreating = false;
+    const ov = overlay();
+    const md = modal();
+    if (ov) ov.classList.add('open');
+    if (md) md.classList.add('open');
+    setMsg('Loading profiles…', null);
+    // Load model catalog
+    api('/api/models')
+      .then(r => r.json())
+      .then(d => {
+        modelsCache = d.providers || {};
+        populateProviderDropdown();
+      })
+      .catch(_ => {});
+    api('/api/profiles')
+      .then(r => r.json())
+      .then(d => {
+        profilesCache = Array.isArray(d.profiles) ? d.profiles : [];
+        renderSidebar();
+        if (selectedProfile) loadProfile(selectedProfile);
+        else setMsg('Select a profile from the sidebar', null);
+      })
+      .catch(err => setMsg('Failed to load profiles: ' + err, false));
+  }
+
+  function populateProviderDropdown() {
+    const peProviderSel = document.getElementById('peProvider');
+    if (!peProviderSel) return;
+    const currentVal = peProviderSel.value;
+    // Keep first two options (default + custom), replace the rest
+    while (peProviderSel.options.length > 2) {
+      peProviderSel.remove(peProviderSel.options.length - 1);
+    }
+    const providers = Object.keys(modelsCache).sort();
+    for (const p of providers) {
+      const opt = document.createElement('option');
+      opt.value = p;
+      opt.textContent = p + ' (' + (modelsCache[p] || []).length + ' models)';
+      peProviderSel.insertBefore(opt, peProviderSel.lastElementChild);
+    }
+    // Restore selection
+    if (currentVal && Array.from(peProviderSel.options).some(o => o.value === currentVal)) {
+      peProviderSel.value = currentVal;
+    }
+  }
+
+  function close() {
+    const ov = overlay();
+    const md = modal();
+    if (ov) ov.classList.remove('open');
+    if (md) md.classList.remove('open');
+  }
+
+  // Provider defaults: base_url, context_length, api_mode
+  const PROVIDER_DEFAULTS = {
+    'nous':          { base_url: 'https://inference-api.nousresearch.com/v1', context_length: '1048576', api_mode: 'chat_completions' },
+    'openrouter':    { base_url: 'https://openrouter.ai/api/v1/', context_length: '1048576', api_mode: 'chat_completions' },
+    'openai':        { base_url: 'https://api.openai.com/v1', context_length: '1048576', api_mode: 'chat_completions' },
+    'anthropic':     { base_url: 'https://api.anthropic.com/v1', context_length: '200000', api_mode: 'messages' },
+    'xai-oauth':     { base_url: 'https://api.x.ai/v1', context_length: '131072', api_mode: 'chat_completions' },
+    'xai':           { base_url: 'https://api.x.ai/v1', context_length: '131072', api_mode: 'chat_completions' },
+    'gemini':        { base_url: 'https://generativelanguage.googleapis.com/v1beta/openai', context_length: '1048576', api_mode: 'chat_completions' },
+    'copilot':       { base_url: 'https://api.githubcopilot.com', context_length: '128000', api_mode: 'chat_completions' },
+    'openai-codex':  { base_url: 'https://api.openai.com/v1', context_length: '1048576', api_mode: 'chat_completions' },
+    'opencode-go':   { base_url: '', context_length: '1048576', api_mode: 'chat_completions' },
+    'opencode-zen':  { base_url: 'https://opencode.ai/zen/go/v1', context_length: '1048576', api_mode: 'chat_completions' },
+    'moonshot':      { base_url: 'https://api.moonshot.cn/v1', context_length: '131072', api_mode: 'chat_completions' },
+    'minimax':       { base_url: 'https://api.minimax.chat/v1', context_length: '262144', api_mode: 'chat_completions' },
+    'stepfun':       { base_url: 'https://api.stepfun.com/v1', context_length: '131072', api_mode: 'chat_completions' },
+    'deepseek':      { base_url: 'https://api.deepseek.com/v1', context_length: '131072', api_mode: 'chat_completions' },
+    'zai':           { base_url: 'https://open.bigmodel.cn/api/paas/v4', context_length: '131072', api_mode: 'chat_completions' },
+    'nvidia':        { base_url: 'https://integrate.api.nvidia.com/v1', context_length: '131072', api_mode: 'chat_completions' },
+    'google-gemini-cli': { base_url: 'https://generativelanguage.googleapis.com/v1beta/openai', context_length: '1048576', api_mode: 'chat_completions' },
+    'ai-gateway':    { base_url: 'https://ai-gateway.vercel.com/v1', context_length: '1048576', api_mode: 'chat_completions' },
+  };
+
+  function applyProviderDefaults(provider) {
+    const defs = PROVIDER_DEFAULTS[provider];
+    if (!defs) return;
+    const baseUrl = document.getElementById('peBaseUrl');
+    const ctxLen = document.getElementById('peContext');
+    const apiMode = document.getElementById('peApiMode');
+    // Always update base_url when provider changes (it's provider-specific)
+    if (baseUrl) baseUrl.value = defs.base_url;
+    // Only fill context_length and api_mode if empty
+    if (ctxLen && !ctxLen.value.trim()) ctxLen.value = defs.context_length;
+    if (apiMode && !apiMode.value.trim()) apiMode.value = defs.api_mode;
+  }
+
+  function init() {
+    document.getElementById('profileEditorClose').addEventListener('click', close);
+    document.getElementById('profileEditorOverlay').addEventListener('click', close);
+    document.getElementById('peSaveBtn').addEventListener('click', () => {
+      if (isCreating) createProfile(); else saveProfile();
+    });
+    document.getElementById('peCreateBtn').addEventListener('click', () => {
+      isCreating = true;
+      selectedProfile = null;
+      document.getElementById('peName').readOnly = false;
+      setFields({});
+      renderSidebar();
+      setMsg('Enter details for the new profile, then click Save', null);
+    });
+    document.getElementById('peDeleteBtn').addEventListener('click', deleteProfile);
+    // Provider change -> update model dropdown + auto-fill base_url/context/api_mode
+    document.getElementById('peProvider').addEventListener('change', () => {
+      toggleCustomField('peProvider', 'peProviderCustom');
+      const sel = document.getElementById('peProvider');
+      if (sel && sel.value && sel.value !== 'custom') {
+        const mdl = document.getElementById('peModel');
+        const currentModel = (mdl && mdl.value === 'custom')
+          ? (document.getElementById('peModelCustom')?.value || '')
+          : (mdl?.value || '');
+        populateModelDropdown(sel.value, currentModel);
+        applyProviderDefaults(sel.value);
+      }
+    });
+    // Model dropdown change -> toggle custom field
+    document.getElementById('peModel').addEventListener('change', () => {
+      toggleCustomField('peModel', 'peModelCustom');
+    });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+  }
+
+  return { open, close, init };
+})();
+window.profileEditor = profileEditor;
+</script>
+  <div id="detailOverlay" class="detail-overlay"></div>
+  <div id="detailSheet" class="detail-sheet">
+    <div class="detail-sheet-header">
+      <div class="detail-sheet-title" id="detailSheetTitle">Task details</div>
+      <button class="detail-sheet-close" id="detailSheetClose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div class="detail-sheet-body">
+      <input id="detailSheetTitleInput" class="inline-edit" type="text" placeholder="Task title…" style="display:none; margin-bottom:8px;" />
+      <textarea id="detailSheetBodyInput" class="inline-edit" placeholder="Task description…" style="display:none; min-height:120px; resize:vertical;"></textarea>
+      <pre id="detailSheetBody">Select a task to see details.</pre>
+      <div class="detail-actions" id="detailActions" style="display:none;">
+        <button class="button" id="detailSaveBtn" type="button">Save</button>
+        <button class="button secondary" id="detailCancelBtn" type="button">Cancel</button>
+        <button class="button secondary" id="detailEditBtn" type="button">Edit</button>
+        <button class="button secondary" id="detailDeleteBtn" type="button">Delete</button>
+        <div class="status-dropdown" id="detailStatusDropdown">
+          <button class="button secondary" id="detailStatusBtn" type="button">Change status</button>
+          <div class="status-dropdown-menu" id="detailStatusMenu"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Profile Editor Modal -->
+  <div id="profileEditorOverlay" class="profile-editor-overlay"></div>
+  <div id="profileEditorModal" class="profile-editor-modal">
+    <div class="profile-editor-header">
+      <div class="profile-editor-title">Profile Editor</div>
+      <button class="profile-editor-close" id="profileEditorClose" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div class="profile-editor-body">
+      <div class="profile-editor-sidebar" id="profileEditorSidebar"></div>
+      <div class="profile-editor-main">
+        <div class="profile-editor-form" id="profileEditorForm">
+          <label for="peName">Name</label>
+          <input id="peName" type="text" placeholder="profile name" />
+          <label for="peProvider">Provider</label>
+          <select id="peProvider">
+            <option value="">-- select provider --</option>
+            <option value="custom">Custom...</option>
+          </select>
+          <input id="peProviderCustom" type="text" placeholder="e.g. openrouter, nous" style="display:none" />
+          <label for="peModel">Default model</label>
+          <select id="peModel">
+            <option value="">-- select model --</option>
+            <option value="custom">Custom...</option>
+          </select>
+          <input id="peModelCustom" type="text" placeholder="e.g. openrouter/deepseek-v4-flash" style="display:none" />
+          <label for="peBaseUrl">Base URL</label>
+          <input id="peBaseUrl" type="text" placeholder="auto-filled when provider selected" />
+          <label for="peContext">Context length</label>
+          <input id="peContext" type="number" placeholder="e.g. 1048576" />
+          <label for="peApiMode">API mode</label>
+          <input id="peApiMode" type="text" placeholder="e.g. chat_completions" />
+          <label for="peReasoningEffort">Reasoning effort</label>
+          <select id="peReasoningEffort">
+            <option value="">default</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+          </select>
+          <label for="peReasoning">Show reasoning</label>
+          <select id="peReasoning">
+            <option value="">default</option>
+            <option value="off">off</option>
+            <option value="on">on</option>
+          </select>
+          <label for="peMaxTurns">Max turns</label>
+          <input id="peMaxTurns" type="number" placeholder="e.g. 90" />
+          <label for="pePersonality">Personality</label>
+          <select id="pePersonality">
+            <option value="">default</option>
+            <option value="kawaii">kawaii</option>
+            <option value="concise">concise</option>
+            <option value="technical">technical</option>
+            <option value="creative">creative</option>
+            <option value="helpful">helpful</option>
+            <option value="teacher">teacher</option>
+            <option value="noir">noir</option>
+            <option value="pirate">pirate</option>
+            <option value="shakespeare">shakespeare</option>
+            <option value="surfer">surfer</option>
+            <option value="catgirl">catgirl</option>
+            <option value="hype">hype</option>
+            <option value="uwu">uwu</option>
+            <option value="philosopher">philosopher</option>
+          </select>
+        </div>
+        <div class="profile-editor-actions">
+          <button class="button" id="peSaveBtn" type="button">Save profile</button>
+          <button class="button secondary" id="peCreateBtn" type="button">Create new</button>
+          <button class="button secondary" id="peDeleteBtn" type="button">Delete</button>
+        </div>
+        <div class="profile-editor-msg" id="peMsg"></div>
+      </div>
+    </div>
+  </div>
+  <!-- Context Menu -->
+  <div id="contextMenu" class="context-menu">
+    <div class="context-menu-item" data-action="edit">Edit title / body</div>
+    <div class="context-menu-item" data-action="done">Mark done</div>
+    <div class="context-menu-item" data-action="blocked">Mark blocked</div>
+    <div class="context-menu-item" data-action="ready">Mark ready</div>
+    <div class="context-menu-sep"></div>
+    <div class="context-menu-item delete" data-action="delete">Delete</div>
+  </div>
+
+</body>
+</html>'''
+
+
+# ---------------------------------------------------------------------------
+# Server-side helpers
+# ---------------------------------------------------------------------------
+
+CHAT_HISTORY_MAX = 200
+
+
+def chat_history_path(board: str) -> Path:
+    return BOARDS_ROOT / board / 'chat-history.json'
+
+
+def _load_chat_store(board: str) -> dict:
+    """Load the full session-indexed chat store for a board."""
+    path = chat_history_path(board)
+    if not path.exists():
+        return {'sessions': {}, 'current_session': None}
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if isinstance(data, dict) and 'sessions' in data:
+            return data
+        # Legacy flat list — migrate to session format
+        if isinstance(data, list):
+            store = {'sessions': {}, 'current_session': None}
+            if data:
+                sid = hashlib.sha256(f"{board}:legacy".encode()).hexdigest()[:12]
+                ts = data[0].get('ts', 1715000000)
+                store['sessions'][sid] = {
+                    'id': sid,
+                    'name': 'Session ' + time.strftime('%Y-%m-%d %H:%M', time.localtime(ts)),
+                    'created_at': ts,
+                    'updated_at': time.time(),
+                    'history': data,
+                }
+                store['current_session'] = sid
+            return store
+    except Exception:
+        pass
+    return {'sessions': {}, 'current_session': None}
+
+
+def _save_chat_store(board: str, store: dict) -> None:
+    """Save the full session-indexed chat store for a board."""
+    path = chat_history_path(board)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Trim each session's history
+        for sid, sess in store.get('sessions', {}).items():
+            if isinstance(sess.get('history'), list) and len(sess['history']) > CHAT_HISTORY_MAX:
+                sess['history'] = sess['history'][-CHAT_HISTORY_MAX:]
+        path.write_text(json.dumps(store, indent=2, ensure_ascii=False), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def load_chat_history(board: str, session_id: str | None = None) -> list:
+    """Load chat history for a specific session, or current session."""
+    store = _load_chat_store(board)
+    sid = session_id or store.get('current_session')
+    if sid and sid in store.get('sessions', {}):
+        return store['sessions'][sid].get('history', [])
+    return []
+
+
+def save_chat_history(board: str, history: list, session_id: str | None = None) -> str | None:
+    """Save chat history, returning the session id. Creates a session if needed."""
+    store = _load_chat_store(board)
+    sid = session_id or store.get('current_session')
+
+    if sid and sid in store.get('sessions', {}):
+        store['sessions'][sid]['history'] = history
+        store['sessions'][sid]['updated_at'] = time.time()
+    else:
+        # Create a new session
+        ts = time.time()
+        sid = hashlib.sha256(f"{board}:{ts}:{len(history)}".encode()).hexdigest()[:12]
+        store.setdefault('sessions', {})[sid] = {
+            'id': sid,
+            'name': 'Session ' + time.strftime('%Y-%m-%d %H:%M', time.localtime(ts)),
+            'created_at': ts,
+            'updated_at': ts,
+            'history': history,
+        }
+        store['current_session'] = sid
+
+    _save_chat_store(board, store)
+    return sid
+
+
+def list_chat_sessions(board: str) -> list[dict]:
+    """Return metadata for all sessions (without full history)."""
+    store = _load_chat_store(board)
+    sessions = store.get('sessions', {})
+    current = store.get('current_session')
+    result = []
+    for sid, sess in sessions.items():
+        last_msg = None
+        history = sess.get('history', [])
+        if history:
+            last_msg = history[-1]
+        result.append({
+            'id': sid,
+            'name': sess.get('name', sid),
+            'created_at': sess.get('created_at', 0),
+            'updated_at': sess.get('updated_at', 0),
+            'message_count': len(history),
+            'last_message': last_msg,
+            'is_current': sid == current,
+        })
+    result.sort(key=lambda s: s.get('updated_at', 0), reverse=True)
+    return result
+
+
+def delete_chat_session(board: str, session_id: str) -> bool:
+    """Delete a session. Returns True if deleted."""
+    store = _load_chat_store(board)
+    if session_id not in store.get('sessions', {}):
+        return False
+    del store['sessions'][session_id]
+    if store.get('current_session') == session_id:
+        # Switch to next available session
+        remaining = list(store['sessions'].keys())
+        store['current_session'] = remaining[0] if remaining else None
+    _save_chat_store(board, store)
+    return True
+
+
+def rename_chat_session(board: str, session_id: str, new_name: str) -> bool:
+    """Rename a session. Returns True if renamed."""
+    store = _load_chat_store(board)
+    if session_id not in store.get('sessions', {}):
+        return False
+    store['sessions'][session_id]['name'] = new_name.strip() or session_id
+    _save_chat_store(board, store)
+    return True
+
+
+def set_current_session(board: str, session_id: str) -> bool:
+    """Set the current active session. Returns True if found."""
+    store = _load_chat_store(board)
+    if session_id not in store.get('sessions', {}):
+        return False
+    store['current_session'] = session_id
+    _save_chat_store(board, store)
+    return True
+
+
+def shell(cmd: str, board: str, profile: str) -> str:
+    env = os.environ.copy()
+    env['HERMES_KANBAN_BOARD'] = board
+    if profile:
+        env['HERMES_PROFILE'] = profile
+    proc = subprocess.run(cmd, shell=True, env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
+    return proc.stdout
+
+
+def hermes_chat(board: str, profile: str, history: list[dict], message: str) -> tuple[str, str]:
+    """Send a chat message to Hermes. Returns (reply, raw_output)."""
+    board_snapshot = shell('hermes kanban list', board, profile)
+    transcript = []
+    for turn in history[-12:]:
+        role = str(turn.get('role', '')).strip().lower()
+        content = str(turn.get('content', '')).strip()
+        if not content:
+            continue
+        if role not in {'user', 'assistant', 'system'}:
+            continue
+        transcript.append(f"{role.title()}: {content}")
+    transcript.append(f"User: {message}")
+    prompt = textwrap.dedent(f"""
+    You are helping direct the selected kanban project.
+    Board: {board}
+    Profile: {profile}
+
+    Current kanban snapshot:
+    {board_snapshot.strip()}
+
+    Conversation so far:
+    {chr(10).join(transcript)}
+
+    Respond with concise, actionable guidance for the selected project.
+    If useful, mention specific task ids from the board. Do not mention that this
+    is a simulation.
+
+    Assistant:
+    """).strip()
+    env = {**os.environ, 'HERMES_KANBAN_BOARD': board, 'HERMES_PROFILE': profile}
+    # Inject openrouter api key from global auth so profile-specific auth gaps don't break chat
+    auth_path = HERMES_HOME / 'auth.json'
+    if auth_path.exists() and not env.get('OPENROUTER_API_KEY'):
+        try:
+            auth_data = json.loads(auth_path.read_text(encoding='utf-8'))
+            for cred in auth_data.get('credential_pool', {}).get('openrouter', []):
+                if cred.get('access_token'):
+                    env['OPENROUTER_API_KEY'] = cred['access_token']
+                    break
+        except Exception:
+            pass
+    proc = subprocess.run(
+        ['hermes', '-p', profile, 'chat', '-q', prompt, '-v'],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    stdout = proc.stdout or ''
+    stderr = proc.stderr or ''
+    combined = stderr + ('\n' if stderr and stdout else '') + stdout
+    if proc.returncode != 0:
+        raise RuntimeError(combined.strip() or f'hermes chat failed with code {proc.returncode}')
+    reply = extract_hermes_reply(stdout)
+    return reply, combined
+
+
+def hermes_create_task(board: str, profile: str, title: str, body: str,
+                       chat_session_id: str = None, parent_task_id: str = None) -> dict:
+    """Create a kanban task. Returns the task dict from hermes kanban create --json."""
+    env = os.environ.copy()
+    env['HERMES_KANBAN_BOARD'] = board
+    if profile:
+        env['HERMES_PROFILE'] = profile
+    args = ['hermes', 'kanban', 'create', title, '--json', '--created-by', 'kanban-browser']
+    if profile:
+        args.extend(['--assignee', profile])
+    if body:
+        args.extend(['--body', body])
+    proc = subprocess.run(args, env=env, capture_output=True, text=True)
+    raw = (proc.stdout or '').strip() or (proc.stderr or '').strip()
+    if proc.returncode != 0:
+        raise RuntimeError(raw or f'hermes kanban create failed with code {proc.returncode}')
+    try:
+        data = json.loads(raw)
+    except Exception:
+        raise RuntimeError(raw or 'hermes kanban create returned non-JSON output')
+    if not isinstance(data, dict):
+        raise RuntimeError('unexpected create response')
+    # Attach metadata about chat session / parent for downstream consumers
+    if chat_session_id:
+        data['chat_session_id'] = chat_session_id
+    if parent_task_id:
+        data['parent_task_id'] = parent_task_id
+    return data
+
+
+def extract_hermes_reply(output: str) -> str:
+    lines = output.splitlines()
+    # Find ALL response box boundaries, then use the LAST one
+    # (agents often produce multiple intermediate boxes during tool calls)
+    box_starts = []
+    box_ends = []
+    current_start = None
+    for i, line in enumerate(lines):
+        if line.startswith('╭') and 'Hermes' in line:
+            current_start = i + 1
+        elif current_start is not None and line.startswith('╰'):
+            box_starts.append(current_start)
+            box_ends.append(i)
+            current_start = None
+    if box_starts and box_ends:
+        # Use the last box — it contains the final response after all tool calls
+        start = box_starts[-1]
+        end = box_ends[-1]
+        if end > start:
+            body = lines[start:end]
+            while body and not body[0].strip():
+                body.pop(0)
+            while body and not body[-1].strip():
+                body.pop()
+            stripped = []
+            for line in body:
+                stripped.append(line[4:] if line.startswith('    ') else line.lstrip())
+            return '\n'.join(stripped).strip()
+    # Fallback: last non-empty line
+    for line in reversed(lines):
+        if line.strip():
+            return line.strip()
+    return ''
+
+
+def parse_tasks(text: str):
+    tasks = []
+    for line in text.splitlines():
+        m = TASK_RE.match(line.strip())
+        if not m:
+            continue
+        d = m.groupdict()
+        tasks.append({
+            'state': d['state'],
+            'id': d['id'],
+            'status': d['status'],
+            'assignee': d['assignee'],
+            'title': d['title'],
+        })
+    return tasks
+
+
+def list_boards():
+    boards = []
+    if BOARDS_ROOT.exists():
+        for entry in sorted(BOARDS_ROOT.iterdir(), key=lambda p: p.name.lower()):
+            if not entry.is_dir():
+                continue
+            meta = {
+                'slug': entry.name,
+                'name': entry.name.replace('-', ' ').title(),
+                'archived': False,
+            }
+            board_json = entry / 'board.json'
+            if board_json.exists():
+                try:
+                    data = json.loads(board_json.read_text())
+                    if isinstance(data, dict):
+                        meta.update({
+                            'slug': data.get('slug', meta['slug']),
+                            'name': data.get('name', meta['name']),
+                            'archived': bool(data.get('archived', False)),
+                        })
+                except Exception:
+                    pass
+            boards.append(meta)
+    if not any(b['slug'] == 'default' for b in boards):
+        boards.insert(0, {'slug': 'default', 'name': 'Default', 'archived': False})
+    current = next((b for b in boards if b['slug'] == DEFAULT_BOARD), boards[0] if boards else {'slug': DEFAULT_BOARD, 'name': DEFAULT_BOARD, 'archived': False})
+    return boards, current
+
+
+def list_profiles():
+    t0 = _now()
+    cached = _PROFILE_CACHE
+    if cached['profiles'] is not None and (_now() - cached['ts']) < _PROFILE_CACHE_TTL:
+        elapsed = _now() - t0
+        print(f'[kanban_browser] list_profiles cache HIT ({elapsed:.3f}s)', file=sys.stderr, flush=True)
+        return cached['profiles'], cached['current']
+    raw = subprocess.run(['hermes', 'profile', 'list'], capture_output=True, text=True, env=os.environ.copy())
+    if raw.returncode != 0:
+        return [], {'name': DEFAULT_PROFILE, 'model': 'unknown'}
+    names = []
+    for line in raw.stdout.splitlines():
+        line = line.rstrip()
+        clean = line.strip()
+        if not clean or clean.startswith('Profile') or clean.startswith('─'):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0].lstrip('◆*')
+        if name and name != 'Profile':
+            names.append(name)
+    profiles = []
+    for name in names:
+        model = 'unknown'
+        proc = subprocess.run(['hermes', '-p', name, 'config', 'show'], capture_output=True, text=True, env=os.environ.copy())
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                m = MODEL_LINE_RE.match(line)
+                if not m:
+                    continue
+                try:
+                    data = ast.literal_eval(m.group('model'))
+                    if isinstance(data, dict):
+                        model = str(data.get('default') or data.get('model') or data.get('provider') or 'unknown')
+                except Exception:
+                    pass
+                break
+        profiles.append({'name': name, 'model': model})
+    current = next((p for p in profiles if p['name'] == DEFAULT_PROFILE), profiles[0] if profiles else {'name': DEFAULT_PROFILE, 'model': 'unknown'})
+    _PROFILE_CACHE['profiles'] = profiles
+    _PROFILE_CACHE['current'] = current
+    _PROFILE_CACHE['ts'] = _now()
+    elapsed = _now() - t0
+    print(f'[kanban_browser] list_profiles cache MISS ({elapsed:.3f}s, {len(names)} profiles)', file=sys.stderr, flush=True)
+    return profiles, current
+
+
+# ---------------------------------------------------------------------------
+# HTTP handler — routes to separate handler methods per domain
+# ---------------------------------------------------------------------------
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def send_json(self, obj, code=200):
+        data = json.dumps(obj, indent=2).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _query(self):
+        parsed = urlparse(self.path)
+        return parsed.path, parse_qs(parsed.query)
+
+    def _board_from_request(self, qs):
+        return qs.get('board', [DEFAULT_BOARD])[0] or DEFAULT_BOARD
+
+    def _profile_from_request(self, qs):
+        return qs.get('profile', [DEFAULT_PROFILE])[0] or DEFAULT_PROFILE
+
+    def _read_json_body(self):
+        length = int(self.headers.get('Content-Length', '0') or '0')
+        raw = self.rfile.read(length).decode('utf-8') if length else '{}'
+        try:
+            return json.loads(raw or '{}')
+        except Exception as exc:
+            self.send_json({'error': f'invalid JSON: {exc}'}, 400)
+            return None
+
+    # ---- GET handlers ----
+
+    def do_GET(self):
+        p, qs = self._query()
+        board = self._board_from_request(qs)
+        profile = self._profile_from_request(qs)
+
+        if p == '/':
+            self._serve_html()
+            return
+        if p == '/api/boards':
+            self._handle_list_boards()
+            return
+        if p == '/api/profiles':
+            self._handle_list_profiles()
+            return
+        if p == '/api/models':
+            self._handle_list_models()
+            return
+        if p == '/api/list':
+            self._handle_list_tasks(board, profile)
+            return
+        if p.startswith('/api/show/'):
+            self._handle_show_task(p, board, profile)
+            return
+        if p == '/api/chat-history':
+            self._handle_get_chat_history(board, qs)
+            return
+        if p == '/api/chat-sessions':
+            self._handle_list_chat_sessions(board)
+            return
+        if p == '/api/chat-export':
+            self._handle_chat_export(board, qs)
+            return
+        if p.startswith('/api/profile/'):
+            self._handle_get_profile(p)
+            return
+        if p == '/api/events':
+            self._handle_events(board, profile)
+            return
+        if p == '/api/ping':
+            self.send_json({'ok': True, 'board': board})
+            return
+        self.send_json({'error': 'not found'}, 404)
+
+    def _serve_html(self):
+        body = HTML.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_list_boards(self):
+        boards, current = list_boards()
+        self.send_json({'boards': boards, 'current_board': current})
+
+    def _handle_list_profiles(self):
+        profiles, current = list_profiles()
+        self.send_json({'profiles': profiles, 'current_profile': current})
+
+    def _handle_list_models(self):
+        """Return model catalog grouped by provider for the profile editor dropdown."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / '.hermes' / 'hermes-agent'))
+        try:
+            from hermes_cli.models import _PROVIDER_MODELS
+            catalog = {}
+            for provider, models in _PROVIDER_MODELS.items():
+                if isinstance(models, list):
+                    catalog[provider] = models
+            # Also expose OpenRouter curated list
+            try:
+                from hermes_cli.models import OPENROUTER_MODELS
+                if 'openrouter' not in catalog:
+                    catalog['openrouter'] = [m[0] if isinstance(m, (list, tuple)) else m for m in OPENROUTER_MODELS]
+            except Exception:
+                pass
+            self.send_json({'providers': catalog})
+        except Exception as exc:
+            self.send_json({'error': str(exc), 'providers': {}}, 500)
+
+    def _handle_list_tasks(self, board, profile):
+        t0 = _now()
+        cache_key = (board, profile)
+        cached = _LIST_CACHE.get(cache_key)
+        if cached and (_now() - cached['ts']) < _LIST_CACHE_TTL:
+            raw = cached['raw']
+            elapsed = _now() - t0
+            print(f'[kanban_browser] /api/list cache HIT ({elapsed:.3f}s)', file=sys.stderr, flush=True)
+        else:
+            raw = shell('hermes kanban list', board, profile)
+            _LIST_CACHE[cache_key] = {'raw': raw, 'ts': _now()}
+            elapsed = _now() - t0
+            print(f'[kanban_browser] /api/list cache MISS ({elapsed:.3f}s)', file=sys.stderr, flush=True)
+        tasks = parse_tasks(raw)
+        order_path = BOARDS_ROOT / board / 'display_order.json'
+        if order_path.exists():
+            try:
+                order = json.loads(order_path.read_text())
+                order_map = {tid: idx for idx, tid in enumerate(order)}
+                tasks.sort(key=lambda t: order_map.get(t['id'], 999999))
+            except Exception:
+                pass
+        self.send_json({'board': board, 'profile': profile, 'summary': raw.splitlines()[0] if raw else '', 'tasks': tasks})
+
+    def _handle_show_task(self, path, board, profile):
+        tid = path.rsplit('/', 1)[-1]
+        raw = shell(f'hermes kanban show {tid}', board, profile)
+        title = ''
+        for line in raw.splitlines():
+            if line.strip().startswith('Task '):
+                title = line.split(':', 1)[-1].strip()
+                break
+        self.send_json({'id': tid, 'title': title, 'raw': raw, 'board': board, 'profile': profile})
+
+    def _handle_get_chat_history(self, board, qs):
+        session_id = qs.get('session', [None])[0] if 'session' in qs else None
+        history = load_chat_history(board, session_id=session_id)
+        self.send_json({'board': board, 'history': history, 'session_id': session_id or ''})
+
+    def _handle_list_chat_sessions(self, board):
+        sessions = list_chat_sessions(board)
+        self.send_json({'board': board, 'sessions': sessions})
+
+    def _handle_chat_export(self, board, qs):
+        session_id = qs.get('session', [None])[0] if 'session' in qs else None
+        export_format = qs.get('format', ['json'])[0] if 'format' in qs else 'json'
+        history = load_chat_history(board, session_id=session_id)
+        store = _load_chat_store(board)
+        sid = session_id or store.get('current_session')
+        session_info = store.get('sessions', {}).get(sid, {})
+        name = session_info.get('name', sid or 'chat')
+        if export_format == 'markdown':
+            lines = [f"# Chat Export: {name}", f"*Date: {time.strftime('%Y-%m-%d %H:%M:%S')}*", f"*Board: {board}*", f"*Session: {sid}*", f"*Messages: {len(history)}*", "", "---", ""]
+            for msg in history:
+                role = msg.get('role', 'unknown')
+                content = str(msg.get('content', ''))
+                ts = msg.get('ts', '')
+                ts_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(ts)) if isinstance(ts, (int, float)) else str(ts)
+                lines.append(f"### {role.title()} ({ts_str})")
+                lines.append("")
+                lines.append(content)
+                lines.append("")
+            body = '\n'.join(lines).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/markdown; charset=utf-8')
+            self.send_header('Content-Disposition', f'attachment; filename="{name.replace(" ", "_")}.md"')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            payload = {
+                'board': board,
+                'session_id': sid,
+                'session_name': name,
+                'exported_at': time.time(),
+                'history': history,
+            }
+            body = json.dumps(payload, indent=2, ensure_ascii=False).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Disposition', f'attachment; filename="{name.replace(" ", "_")}.json"')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    # ---- SSE endpoint ----
+
+    def _handle_events(self, board, profile):
+        """Server-Sent Events endpoint — streams real-time board updates."""
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.send_header('X-Accel-Buffering', 'no')  # nginx
+        self.end_headers()
+
+        # Subscribe to all event types
+        event_types = ['task-changed', 'chat-message', 'board-update', 'profile-changed']
+        subs = {et: event_bus.subscribe(et) for et in event_types}
+
+        # Send initial connection event so the client knows it's live
+        self._sse_send('connected', {'board': board, 'profile': profile})
+
+        try:
+            while not getattr(self.server, '_shutdown_request', False):
+                # Poll all subscribed queues with a shared deadline
+                deadline = time.time() + 10
+                got_data = False
+                for et in event_types:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        msg = subs[et].get(timeout=min(remaining, 10))
+                        self._sse_send(et, msg.get('data', msg))
+                        got_data = True
+                    except queue.Empty:
+                        continue
+                if not got_data:
+                    # Keepalive comment — prevents proxies from timing out
+                    try:
+                        self.wfile.write(b': keepalive\n\n')
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass  # client disconnected — clean exit
+        except Exception:
+            pass  # don't crash the server on one bad SSE client
+        finally:
+            for et in event_types:
+                event_bus.unsubscribe(et, subs[et])
+
+    def _sse_send(self, event_type, data):
+        """Format and flush a single SSE message."""
+        payload = json.dumps(data, default=str)
+        self.wfile.write(f'event: {event_type}\ndata: {payload}\n\n'.encode('utf-8'))
+        self.wfile.flush()
+
+    # ---- POST handlers ----
+
+    def do_POST(self):
+        p, qs = self._query()
+
+        if p == '/api/chat':
+            self._handle_chat(qs)
+            return
+        if p == '/api/create-task':
+            self._handle_create_task(qs)
+            return
+        if p == '/api/chat-history':
+            self._handle_post_chat_history(qs)
+            return
+        if p == '/api/chat-sessions':
+            self._handle_post_chat_session(qs)
+            return
+        if p == '/api/chat-sessions/switch':
+            self._handle_switch_chat_session(qs)
+            return
+        if p == '/api/profile':
+            self._handle_create_profile(qs)
+            return
+        if p.startswith('/api/profile/'):
+            self._handle_update_profile(p, qs)
+            return
+        m = __import__('re').match(r'^/api/tasks/([^/]+)/transition$', p)
+        if m:
+            self._handle_transition_task(m.group(1), qs)
+            return
+        if p == '/api/reorder':
+            self._handle_reorder(qs)
+            return
+        self.send_json({'error': 'not found'}, 404)
+
+    def _handle_chat(self, qs):
+        body = self._read_json_body()
+        if body is None:
+            return
+        board = str(body.get('board') or self._board_from_request(qs) or DEFAULT_BOARD)
+        profile = str(body.get('profile') or self._profile_from_request(qs) or DEFAULT_PROFILE)
+        message = str(body.get('message') or '').strip()
+        history = body.get('history') or []
+        if not message:
+            self.send_json({'error': 'message is required'}, 400)
+            return
+        try:
+            reply, raw = hermes_chat(board, profile, history, message)
+        except Exception as exc:
+            self.send_json({'error': str(exc)}, 500)
+            return
+        # Persist chat history server-side
+        server_history = load_chat_history(board, session_id=body.get('session_id'))
+        server_history.append({'role': 'user', 'content': message, 'ts': time.time()})
+        server_history.append({'role': 'assistant', 'content': reply, 'ts': time.time()})
+        session_id = save_chat_history(board, server_history, session_id=body.get('session_id'))
+        self.send_json({
+            'board': board,
+            'profile': profile,
+            'reply': reply,
+            'raw': raw,
+            'chat_session_id': session_id,
+        })
+        # Notify SSE clients of new chat message
+        event_bus.emit('chat-message', {
+            'board': board,
+            'profile': profile,
+            'session_id': session_id,
+        })
+
+    def _handle_create_task(self, qs):
+        body = self._read_json_body()
+        if body is None:
+            return
+        board = str(body.get('board') or self._board_from_request(qs) or DEFAULT_BOARD)
+        title = str(body.get('title') or '').strip()
+        body_text = str(body.get('body') or '').strip()
+        chat_session_id = body.get('chat_session_id') or None
+        parent_task_id = body.get('parent_task_id') or None
+        assignee = str(body.get('assignee') or body.get('profile') or OVERSEER_PROFILE)
+        if not title:
+            self.send_json({'error': 'title is required'}, 400)
+            return
+        try:
+            task = hermes_create_task(
+                board, assignee, title, body_text,
+                chat_session_id=chat_session_id,
+                parent_task_id=parent_task_id,
+            )
+        except Exception as exc:
+            self.send_json({'error': str(exc)}, 500)
+            return
+        self.send_json({'board': board, 'profile': assignee, 'assignee': assignee, 'task': task})
+        # Notify SSE clients of new/changed task
+        event_bus.emit('task-changed', {
+            'board': board,
+            'task_id': task.get('id', task.get('task_id', '')),
+            'action': 'created',
+            'assignee': assignee,
+        })
+
+    def _handle_post_chat_history(self, qs):
+        body = self._read_json_body()
+        if body is None:
+            return
+        b = str(body.get('board') or self._board_from_request(qs) or DEFAULT_BOARD)
+        history = body.get('history')
+        if not isinstance(history, list):
+            self.send_json({'error': 'history must be a list'}, 400)
+            return
+        session_id = body.get('session_id')
+        if session_id:
+            save_chat_history(b, history, session_id=session_id)
+        else:
+            session_id = save_chat_history(b, history)
+        self.send_json({'board': b, 'saved': True, 'count': len(history), 'session_id': session_id})
+
+    def _handle_post_chat_session(self, qs):
+        """Handle rename, delete, or create session operations."""
+        body = self._read_json_body()
+        if body is None:
+            return
+        b = str(body.get('board') or self._board_from_request(qs) or DEFAULT_BOARD)
+        action = str(body.get('action') or '').strip()
+        session_id = str(body.get('session_id') or '').strip()
+        if not session_id:
+            self.send_json({'error': 'session_id is required'}, 400)
+            return
+        if action == 'rename':
+            new_name = str(body.get('name') or '').strip()
+            if not new_name:
+                self.send_json({'error': 'name is required'}, 400)
+                return
+            ok = rename_chat_session(b, session_id, new_name)
+            if ok:
+                self.send_json({'board': b, 'session_id': session_id, 'renamed': True, 'name': new_name})
+            else:
+                self.send_json({'error': 'session not found'}, 404)
+        elif action == 'delete':
+            ok = delete_chat_session(b, session_id)
+            if ok:
+                # Return current session info for client to switch to
+                store = _load_chat_store(b)
+                current = store.get('current_session')
+                self.send_json({'board': b, 'session_id': session_id, 'deleted': True, 'current_session': current})
+            else:
+                self.send_json({'error': 'session not found'}, 404)
+        else:
+            self.send_json({'error': f'unknown action: {action}'}, 400)
+
+    def _handle_switch_chat_session(self, qs):
+        body = self._read_json_body()
+        if body is None:
+            return
+        b = str(body.get('board') or self._board_from_request(qs) or DEFAULT_BOARD)
+        session_id = str(body.get('session_id') or '').strip()
+        if not session_id:
+            self.send_json({'error': 'session_id is required'}, 400)
+            return
+        ok = set_current_session(b, session_id)
+        if ok:
+            history = load_chat_history(b, session_id=session_id)
+            self.send_json({'board': b, 'session_id': session_id, 'switched': True, 'history': history})
+        else:
+            self.send_json({'error': 'session not found'}, 404)
+
+    def _handle_delete_chat_session(self, qs):
+        """DELETE /api/chat-sessions?board=X&session=Y"""
+        b = str(self._board_from_request(qs) or DEFAULT_BOARD)
+        session_id = qs.get('session', [None])[0] if 'session' in qs else None
+        if not session_id:
+            self.send_json({'error': 'session parameter required'}, 400)
+            return
+        ok = delete_chat_session(b, session_id)
+        if ok:
+            store = _load_chat_store(b)
+            current = store.get('current_session')
+            self.send_json({'board': b, 'session_id': session_id, 'deleted': True, 'current_session': current})
+        else:
+            self.send_json({'error': 'session not found'}, 404)
+
+    def do_PATCH(self):
+        p, qs = self._query()
+        if p.startswith('/api/tasks/'):
+            self._handle_patch_task(p, qs)
+            return
+        self.send_json({'error': 'not found'}, 404)
+
+    def do_DELETE(self):
+        p, qs = self._query()
+        if p == '/api/chat-sessions':
+            self._handle_delete_chat_session(qs)
+            return
+        if p.startswith('/api/profile/'):
+            self._handle_delete_profile(p)
+            return
+        if p.startswith('/api/tasks/'):
+            self._handle_delete_task(p, qs)
+            return
+        self.send_json({'error': 'not found'}, 404)
+
+    def _handle_patch_task(self, path, qs):
+        tid = path.rsplit('/', 1)[-1]
+        body = self._read_json_body()
+        if body is None:
+            return
+        board = str(body.get('board') or self._board_from_request(qs) or DEFAULT_BOARD)
+        title = str(body.get('title', '')).strip()
+        body_text = str(body.get('body', '')).strip()
+        new_status = str(body.get('status', '')).strip().lower()
+        new_assignee = str(body.get('assignee', '')).strip()
+        if not title and not body_text and not new_status and not new_assignee:
+            self.send_json({'error': 'at least one field (title, body, status, assignee) is required'}, 400)
+            return
+        # Validate status if provided
+        valid_statuses = {'todo', 'ready', 'running', 'done', 'blocked', 'scheduled', 'review', 'triage', 'archived'}
+        if new_status and new_status not in valid_statuses:
+            self.send_json({'error': f'invalid status: {new_status}'}, 400)
+            return
+        try:
+            import sqlite3
+            sys.path.insert(0, str(Path(__file__).parent.parent / '.hermes' / 'hermes-agent'))
+            from hermes_cli import kanban_db as kb
+            with kb.connect(board=board) as conn:
+                cur = conn.execute("SELECT id FROM tasks WHERE id = ?", (tid,))
+                if not cur.fetchone():
+                    self.send_json({'error': 'task not found'}, 404)
+                    return
+                updates = []
+                params = []
+                if title:
+                    updates.append("title = ?")
+                    params.append(title)
+                if body_text:
+                    updates.append("body = ?")
+                    params.append(body_text)
+                if new_status:
+                    updates.append("status = ?")
+                    params.append(new_status)
+                if new_assignee:
+                    updates.append("assignee = ?")
+                    params.append(new_assignee)
+                if updates:
+                    params.append(tid)
+                    conn.execute(f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?", params)
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                        (tid, 'edited', json.dumps({'fields': [k.split()[0] for k in updates]}), int(time.time()))
+                    )
+        except Exception as exc:
+            self.send_json({'error': str(exc)}, 500)
+            return
+        self.send_json({'id': tid, 'updated': True})
+        event_bus.emit('task-changed', {'board': board, 'task_id': tid, 'action': 'edited'})
+
+    def _handle_delete_task(self, path, qs):
+        tid = path.rsplit('/', 1)[-1]
+        board = self._board_from_request(qs)
+        try:
+            sys.path.insert(0, str(Path(__file__).parent.parent / '.hermes' / 'hermes-agent'))
+            from hermes_cli import kanban_db as kb
+            with kb.connect(board=board) as conn:
+                if not kb.delete_task(conn, tid):
+                    self.send_json({'error': 'task not found'}, 404)
+                    return
+        except Exception as exc:
+            self.send_json({'error': str(exc)}, 500)
+            return
+        self.send_json({'id': tid, 'deleted': True})
+        event_bus.emit('task-changed', {'board': board, 'task_id': tid, 'action': 'deleted'})
+
+    def _handle_transition_task(self, path, qs):
+        tid = path.rsplit('/', 1)[-1]
+        body = self._read_json_body()
+        if body is None:
+            return
+        board = str(body.get('board') or self._board_from_request(qs) or DEFAULT_BOARD)
+        new_status = str(body.get('status') or '').strip().lower()
+        reason = str(body.get('reason') or '').strip()
+        if not new_status:
+            self.send_json({'error': 'status is required'}, 400)
+            return
+        valid = {'todo', 'ready', 'running', 'done', 'blocked', 'scheduled', 'review', 'triage', 'archived'}
+        if new_status not in valid:
+            self.send_json({'error': f'invalid status: {new_status}'}, 400)
+            return
+        try:
+            sys.path.insert(0, str(Path(__file__).parent.parent / '.hermes' / 'hermes-agent'))
+            from hermes_cli import kanban_db as kb
+            with kb.connect(board=board) as conn:
+                cur = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,))
+                row = cur.fetchone()
+                if not row:
+                    self.send_json({'error': 'task not found'}, 404)
+                    return
+                old_status = row[0]
+                if old_status == new_status:
+                    self.send_json({'id': tid, 'status': new_status, 'transitioned': False})
+                    return
+                # Use semantic helpers where available; fall back to raw UPDATE.
+                ok = False
+                if new_status == 'done':
+                    ok = kb.complete_task(conn, tid, result=reason or None)
+                elif new_status == 'blocked':
+                    ok = kb.block_task(conn, tid, reason=reason or None)
+                elif new_status == 'ready' and old_status == 'blocked':
+                    ok = kb.unblock_task(conn, tid)
+                elif new_status == 'archived':
+                    ok = kb.archive_task(conn, tid)
+                elif new_status == 'scheduled':
+                    ok = kb.schedule_task(conn, tid, reason=reason or None)
+                else:
+                    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (new_status, tid))
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                        (tid, 'transition', json.dumps({'from': old_status, 'to': new_status}), int(time.time()))
+                    )
+                    ok = True
+                if not ok:
+                    self.send_json({'error': f'cannot transition {tid} from {old_status} to {new_status}'}, 409)
+                    return
+        except Exception as exc:
+            self.send_json({'error': str(exc)}, 500)
+            return
+        self.send_json({'id': tid, 'status': new_status, 'old_status': old_status, 'transitioned': True})
+        event_bus.emit('task-changed', {'board': board, 'task_id': tid, 'action': 'transitioned', 'status': new_status})
+
+    def _handle_reorder(self, qs):
+        body = self._read_json_body()
+        if body is None:
+            return
+        board = str(body.get('board') or self._board_from_request(qs) or DEFAULT_BOARD)
+        order = body.get('order', [])
+        if not isinstance(order, list):
+            self.send_json({'error': 'order must be a list'}, 400)
+            return
+        order_path = BOARDS_ROOT / board / 'display_order.json'
+        try:
+            order_path.write_text(json.dumps(order, indent=2))
+            self.send_json({'ok': True, 'board': board})
+            event_bus.emit('board-update', {'board': board})
+        except Exception as exc:
+            self.send_json({'error': str(exc)}, 500)
+
+    def _handle_get_profile(self, path):
+        name = path.rsplit('/', 1)[-1]
+        if name == 'default':
+            config_path = HERMES_HOME / 'config.yaml'
+        else:
+            config_path = HERMES_HOME / 'profiles' / name / 'config.yaml'
+        if not config_path.exists():
+            self.send_json({'error': f'profile not found: {name}'}, 404)
+            return
+        try:
+            import yaml
+            data = yaml.safe_load(config_path.read_text(encoding='utf-8')) or {}
+        except Exception as exc:
+            self.send_json({'error': f'failed to read profile: {exc}'}, 500)
+            return
+        model = data.get('model', {}) or {}
+        agent = data.get('agent', {}) or {}
+        display = data.get('display', {}) or {}
+        self.send_json({
+            'name': name,
+            'model_default': model.get('default', ''),
+            'provider': model.get('provider', ''),
+            'base_url': model.get('base_url', ''),
+            'context_length': str(model.get('context_length', '')) if model.get('context_length') is not None else '',
+            'api_mode': model.get('api_mode', ''),
+            'reasoning_effort': model.get('reasoning_effort', ''),
+            'max_turns': str(agent.get('max_turns', '')) if agent.get('max_turns') is not None else '',
+            'personality': display.get('personality', ''),
+            'show_reasoning': display.get('show_reasoning', ''),
+        })
+
+    def _handle_update_profile(self, path, qs):
+        name = path.rsplit('/', 1)[-1]
+        body = self._read_json_body()
+        if body is None:
+            return
+        if name == 'default':
+            config_path = HERMES_HOME / 'config.yaml'
+        else:
+            config_path = HERMES_HOME / 'profiles' / name / 'config.yaml'
+        if not config_path.exists():
+            self.send_json({'error': f'profile not found: {name}'}, 404)
+            return
+        fields = {
+            'model.default': body.get('model_default'),
+            'model.provider': body.get('provider'),
+            'model.base_url': body.get('base_url'),
+            'model.context_length': body.get('context_length'),
+            'model.api_mode': body.get('api_mode'),
+            'model.reasoning_effort': body.get('reasoning_effort'),
+            'agent.max_turns': body.get('max_turns'),
+            'display.personality': body.get('personality'),
+            'display.show_reasoning': body.get('show_reasoning'),
+        }
+        errors = []
+        for key, value in fields.items():
+            if value is None or value == '':
+                continue
+            try:
+                proc = subprocess.run(
+                    ['hermes', '-p', name, 'config', 'set', key, str(value)],
+                    capture_output=True, text=True, env=os.environ.copy(),
+                )
+                if proc.returncode != 0:
+                    errors.append(f'{key}: {proc.stderr.strip() or proc.stdout.strip() or "unknown error"}')
+            except Exception as exc:
+                errors.append(f'{key}: {exc}')
+        if errors:
+            self.send_json({'error': 'partial update failed', 'details': errors}, 500)
+            return
+        self.send_json({'name': name, 'updated': True})
+
+    def _handle_create_profile(self, qs):
+        body = self._read_json_body()
+        if body is None:
+            return
+        name = str(body.get('name') or '').strip()
+        if not name:
+            self.send_json({'error': 'name is required'}, 400)
+            return
+        source = str(body.get('clone_from') or DEFAULT_PROFILE)
+        try:
+            proc = subprocess.run(
+                ['hermes', 'profile', 'create', '--clone-from', source, '--no-alias', name],
+                capture_output=True, text=True, env=os.environ.copy(),
+            )
+            if proc.returncode != 0:
+                self.send_json({'error': proc.stderr.strip() or proc.stdout.strip() or 'profile create failed'}, 500)
+                return
+        except Exception as exc:
+            self.send_json({'error': str(exc)}, 500)
+            return
+        # Apply any additional fields beyond the clone
+        fields = {
+            'model.default': body.get('model_default'),
+            'model.provider': body.get('provider'),
+            'model.base_url': body.get('base_url'),
+            'model.context_length': body.get('context_length'),
+            'model.api_mode': body.get('api_mode'),
+            'model.reasoning_effort': body.get('reasoning_effort'),
+            'agent.max_turns': body.get('max_turns'),
+            'display.personality': body.get('personality'),
+            'display.show_reasoning': body.get('show_reasoning'),
+        }
+        for key, value in fields.items():
+            if value is None or value == '':
+                continue
+            try:
+                subprocess.run(
+                    ['hermes', '-p', name, 'config', 'set', key, str(value)],
+                    capture_output=True, text=True, env=os.environ.copy(),
+                )
+            except Exception:
+                pass
+        self.send_json({'name': name, 'created': True})
+
+    def _handle_delete_profile(self, path):
+        name = path.rsplit('/', 1)[-1]
+        try:
+            proc = subprocess.run(
+                ['hermes', 'profile', 'delete', '-y', name],
+                capture_output=True, text=True, env=os.environ.copy(),
+            )
+            if proc.returncode != 0:
+                self.send_json({'error': proc.stderr.strip() or proc.stdout.strip() or 'profile delete failed'}, 500)
+                return
+        except Exception as exc:
+            self.send_json({'error': str(exc)}, 500)
+            return
+        self.send_json({'name': name, 'deleted': True})
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    server = ThreadingHTTPServer(('0.0.0.0', PORT), H)
+    print(f'Kanban browser on http://0.0.0.0:{PORT}')
+    server.serve_forever()
+
+
+if __name__ == '__main__':
+    main()
