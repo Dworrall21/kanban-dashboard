@@ -76,7 +76,7 @@ async function refresh() {
     document.getElementById('summary').innerHTML = `${tasks.length} tasks · ${counts.done || 0} done · ${counts.running || 0} running`;
     
     renderBoardSelector(boardsData.boards || []);
-    renderProfileSelector(profiles);
+    renderProfileSelector(profiles.profiles || []);
     renderTasks(tasks);
     bus.emit('board-loaded', { board: currentBoard, tasks });
   } catch (err) {
